@@ -1382,13 +1382,20 @@ void sstable::rewrite_statistics() {
     // When rewriting statistics, we also need to update the scylla component
     // because it contains the digest of the statistics component.
     if (has_scylla_component()) {
-        _components_digests.statistics_digest = w->full_checksum();
-        _components->scylla_metadata->data.set<scylla_metadata_type::ComponentsDigests>(components_digests{_components_digests});
+        scylla_metadata metadata;
+        read_simple<component_type::Scylla>(metadata).get();
+        auto cd = metadata.data.get<scylla_metadata_type::ComponentsDigests, components_digests>();
+        if (cd) {
+            cd->statistics_digest = w->full_checksum();
+        } else {
+            metadata.data.set<scylla_metadata_type::ComponentsDigests>(components_digests{.statistics_digest = w->full_checksum()});
+        }
         sstlog.debug("Rewriting scylla component of sstable {}", get_filename());
-        write_simple<component_type::TemporaryScylla>(*_components->scylla_metadata);
+        write_simple<component_type::TemporaryScylla>(metadata);
 
         // rename() guarantees atomicity when renaming a file into place.
         sstable_write_io_check(rename_file, fmt::to_string(filename(component_type::TemporaryScylla)), fmt::to_string(filename(component_type::Scylla))).get();
+        _components_digests.statistics_digest = w->full_checksum();
     }
 
     // rename() guarantees atomicity when renaming a file into place.
