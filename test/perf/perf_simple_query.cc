@@ -27,6 +27,7 @@
 #include "db/extensions.hh"
 #include "db/tags/extension.hh"
 #include "gms/gossiper.hh"
+#include "types/set.hh"
 
 static const sstring table_name = "cf";
 
@@ -37,25 +38,65 @@ static bytes make_key(uint64_t sequence) {
     return b;
 };
 
-static void execute_update_for_key(cql_test_env& env, const bytes& key) {
-    env.execute_cql(fmt::format("UPDATE cf SET "
-        "\"C0\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a,"
-        "\"C1\" = 0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51,"
-        "\"C2\" = 0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64,"
-        "\"C3\" = 0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7,"
-        "\"C4\" = 0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27 "
-        "WHERE \"KEY\"= 0x{};", to_hex(key))).get();
-};
+// Build a comma-separated column list like: "C0", "C1", "C2"
+static sstring make_column_list(unsigned cell_count) {
+    sstring result;
+    for (unsigned i = 0; i < cell_count; ++i) {
+        if (i > 0) {
+            result += ", ";
+        }
+        result += format("\"C{}\"", i);
+    }
+    return result;
+}
 
-static void execute_counter_update_for_key(cql_test_env& env, const bytes& key) {
-    env.execute_cql(fmt::format("UPDATE cf SET "
-        "\"C0\" = \"C0\" + 1,"
-        "\"C1\" = \"C1\" + 2,"
-        "\"C2\" = \"C2\" + 3,"
-        "\"C3\" = \"C3\" + 4,"
-        "\"C4\" = \"C4\" + 5 "
-        "WHERE \"KEY\"= 0x{};", to_hex(key))).get();
-};
+// Generate a deterministic hex string representing a blob of the given size.
+static sstring make_blob_hex(unsigned cell_size) {
+    bytes b(bytes::initialized_later(), cell_size);
+    for (unsigned i = 0; i < cell_size; ++i) {
+        b[i] = static_cast<int8_t>(i & 0xff);
+    }
+    return to_hex(b);
+}
+
+// Build SET assignments for an UPDATE with blob values, e.g.:
+// "C0" = 0xabcd, "C1" = 0xabcd
+static sstring make_update_set_clause(unsigned cell_count, const sstring& blob_hex) {
+    sstring result;
+    for (unsigned i = 0; i < cell_count; ++i) {
+        if (i > 0) {
+            result += ",";
+        }
+        result += format("\"C{}\" = 0x{}", i, blob_hex);
+    }
+    return result;
+}
+
+// Build SET assignments for a counter UPDATE, e.g.:
+// "C0" = "C0" + 1, "C1" = "C1" + 2
+static sstring make_counter_set_clause(unsigned cell_count) {
+    sstring result;
+    for (unsigned i = 0; i < cell_count; ++i) {
+        if (i > 0) {
+            result += ",";
+        }
+        result += format("\"C{0}\" = \"C{0}\" + {1}", i, i + 1);
+    }
+    return result;
+}
+
+// Generate a CQL set literal like {0, 1, 2, ..., N-1}
+static sstring make_set_literal(unsigned collection_size) {
+    sstring result = "{";
+    for (unsigned i = 0; i < collection_size; ++i) {
+        if (i > 0) {
+            result += ", ";
+        }
+        result += format("{}", i);
+    }
+    result += "}";
+    return result;
+}
 
 struct test_config {
     enum class run_mode { read, write, del };
@@ -72,6 +113,10 @@ struct test_config {
     sstring timeout;
     bool bypass_cache;
     std::optional<unsigned> initial_tablets;
+    unsigned cell_count = 5;
+    unsigned cell_size = 34;
+    bool collection_column = false;
+    unsigned collection_size = 10;
 };
 
 std::ostream& operator<<(std::ostream& os, const test_config::run_mode& m) {
@@ -84,23 +129,32 @@ std::ostream& operator<<(std::ostream& os, const test_config::run_mode& m) {
 }
 
 std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
-    return os << "{partitions=" << cfg.partitions
+    os << "{partitions=" << cfg.partitions
            << ", concurrency=" << cfg.concurrency
            << ", mode=" << cfg.mode
            << ", query_single_key=" << (cfg.query_single_key ? "yes" : "no")
            << ", counters=" << (cfg.counters ? "yes" : "no")
-           << "}";
+           << ", cell_count=" << cfg.cell_count
+           << ", cell_size=" << cfg.cell_size;
+    if (cfg.collection_column) {
+        os << ", collection_column=yes"
+           << ", collection_size=" << cfg.collection_size;
+    }
+    return os << "}";
 }
 
 static void create_partitions(cql_test_env& env, test_config& cfg) {
     std::cout << "Creating " << cfg.partitions << " partitions..." << std::endl;
+    auto set_clause = cfg.counters
+        ? make_counter_set_clause(cfg.cell_count)
+        : make_update_set_clause(cfg.cell_count, make_blob_hex(cfg.cell_size));
+    if (cfg.collection_column && !cfg.counters) {
+        set_clause += format(",\"CC\" = {}", make_set_literal(cfg.collection_size));
+    }
     unsigned next_flush = (cfg.memtable_partitions > 0 ? cfg.memtable_partitions : cfg.partitions);
     for (unsigned sequence = 0; sequence < cfg.partitions; ++sequence) {
-        if (cfg.counters) {
-            execute_counter_update_for_key(env, make_key(sequence));
-        } else {
-            execute_update_for_key(env, make_key(sequence));
-        }
+        env.execute_cql(format("UPDATE cf SET {} WHERE \"KEY\"= 0x{};",
+            set_clause, to_hex(make_key(sequence)))).get();
         if (sequence + 1 >= next_flush) {
             env.db().invoke_on_all(&replica::database::flush_all_memtables).get();
             next_flush += cfg.memtable_partitions;
@@ -123,7 +177,11 @@ static bytes make_random_key(test_config& cfg) {
 
 static std::vector<perf_result> test_read(cql_test_env& env, test_config& cfg) {
     create_partitions(env, cfg);
-    sstring query = "select \"C0\", \"C1\", \"C2\", \"C3\", \"C4\" from cf where \"KEY\" = ?";
+    auto columns = make_column_list(cfg.cell_count);
+    if (cfg.collection_column) {
+        columns += ", \"CC\"";
+    }
+    sstring query = format("select {} from cf where \"KEY\" = ?", columns);
     if (cfg.bypass_cache) {
         query += " bypass cache";
     }
@@ -142,13 +200,13 @@ static std::vector<perf_result> test_write(cql_test_env& env, test_config& cfg) 
     if (!cfg.timeout.empty()) {
         usings += "USING TIMEOUT " + cfg.timeout;
     }
-    sstring query = format("UPDATE cf {}SET "
-            "\"C0\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a,"
-            "\"C1\" = 0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51,"
-            "\"C2\" = 0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64,"
-            "\"C3\" = 0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7,"
-            "\"C4\" = 0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27 "
-            "WHERE \"KEY\" = ?", usings);
+    auto blob_hex = make_blob_hex(cfg.cell_size);
+    auto set_clause = make_update_set_clause(cfg.cell_count, blob_hex);
+    if (cfg.collection_column) {
+        set_clause += format(",\"CC\" = {}", make_set_literal(cfg.collection_size));
+    }
+    sstring query = format("UPDATE cf {}SET {} WHERE \"KEY\" = ?",
+            usings, set_clause);
     auto id = env.prepare(query).get();
     return time_parallel([&env, &cfg, id] {
             bytes key = make_random_key(cfg);
@@ -162,7 +220,12 @@ static std::vector<perf_result> test_delete(cql_test_env& env, test_config& cfg)
     if (!cfg.timeout.empty()) {
         usings += "USING TIMEOUT " + cfg.timeout;
     }
-    sstring query = format("DELETE \"C0\", \"C1\", \"C2\", \"C3\", \"C4\" FROM cf {}WHERE \"KEY\" = ?", usings);
+    auto columns = make_column_list(cfg.cell_count);
+    if (cfg.collection_column) {
+        columns += ", \"CC\"";
+    }
+    sstring query = format("DELETE {} FROM cf {}WHERE \"KEY\" = ?",
+            columns, usings);
     auto id = env.prepare(query).get();
     return time_parallel([&env, &cfg, id] {
             bytes key = make_random_key(cfg);
@@ -175,13 +238,8 @@ static std::vector<perf_result> test_counter_update(cql_test_env& env, test_conf
     if (!cfg.timeout.empty()) {
         usings += "USING TIMEOUT " + cfg.timeout;
     }
-    sstring query = format("UPDATE cf {}SET "
-            "\"C0\" = \"C0\" + 1,"
-            "\"C1\" = \"C1\" + 2,"
-            "\"C2\" = \"C2\" + 3,"
-            "\"C3\" = \"C3\" + 4,"
-            "\"C4\" = \"C4\" + 5 "
-            "WHERE \"KEY\" = ?", usings);
+    sstring query = format("UPDATE cf {}SET {} WHERE \"KEY\" = ?",
+            usings, make_counter_set_clause(cfg.cell_count));
     auto id = env.prepare(query).get();
     return time_parallel([&env, &cfg, id] {
             bytes key = make_random_key(cfg);
@@ -189,31 +247,30 @@ static std::vector<perf_result> test_counter_update(cql_test_env& env, test_conf
         }, cfg.concurrency, cfg.duration_in_seconds, cfg.operations_per_shard, cfg.stop_on_error);
 }
 
-static schema_ptr make_counter_schema(std::string_view ks_name) {
-    return schema_builder(ks_name, "cf")
-            .with_column("KEY", bytes_type, column_kind::partition_key)
-            .with_column("C0", counter_type)
-            .with_column("C1", counter_type)
-            .with_column("C2", counter_type)
-            .with_column("C3", counter_type)
-            .with_column("C4", counter_type)
-            .build();
+static schema_ptr make_counter_schema(std::string_view ks_name, unsigned cell_count) {
+    auto builder = schema_builder(ks_name, "cf")
+            .with_column("KEY", bytes_type, column_kind::partition_key);
+    for (unsigned i = 0; i < cell_count; ++i) {
+        builder.with_column(to_bytes(format("C{}", i)), counter_type);
+    }
+    return builder.build();
 }
 
 static std::vector<perf_result> do_cql_test(cql_test_env& env, test_config& cfg) {
     std::cout << "Running test with config: " << cfg << std::endl;
     env.create_table([&cfg] (auto ks_name) {
         if (cfg.counters) {
-            return *make_counter_schema(ks_name);
+            return *make_counter_schema(ks_name, cfg.cell_count);
         }
-        return *schema_builder(ks_name, "cf")
-                .with_column("KEY", bytes_type, column_kind::partition_key)
-                .with_column("C0", bytes_type)
-                .with_column("C1", bytes_type)
-                .with_column("C2", bytes_type)
-                .with_column("C3", bytes_type)
-                .with_column("C4", bytes_type)
-                .build();
+        auto builder = schema_builder(ks_name, "cf")
+                .with_column("KEY", bytes_type, column_kind::partition_key);
+        for (unsigned i = 0; i < cfg.cell_count; ++i) {
+            builder.with_column(to_bytes(format("C{}", i)), bytes_type);
+        }
+        if (cfg.collection_column) {
+            builder.with_column(to_bytes("CC"), set_type_impl::get_instance(int32_type, true));
+        }
+        return *builder.build();
     }).get();
 
     std::cout << "Disabling auto compaction" << std::endl;
@@ -243,6 +300,12 @@ void write_json_result(std::string result_file, const test_config& cfg, const ag
     params["partitions"] = cfg.partitions;
     params["cpus"] = smp::count;
     params["duration"] = cfg.duration_in_seconds;
+    params["cell_count"] = cfg.cell_count;
+    params["cell_size"] = cfg.cell_size;
+    if (cfg.collection_column) {
+        params["collection_column"] = true;
+        params["collection_size"] = cfg.collection_size;
+    }
     params["concurrency,partitions,cpus,duration"] = fmt::format("{},{},{},{}", cfg.concurrency, cfg.partitions, smp::count, cfg.duration_in_seconds);
     if (cfg.initial_tablets) {
         params["initial_tablets"] = cfg.initial_tablets.value();
@@ -294,6 +357,10 @@ int scylla_simple_query_main(int argc, char** argv) {
         ("stop-on-error", bpo::value<bool>()->default_value(true), "stop after encountering the first error")
         ("timeout", bpo::value<std::string>()->default_value(""), "use timeout")
         ("bypass-cache", "use bypass cache when querying")
+        ("cell-count", bpo::value<unsigned>()->default_value(5), "number of cells (columns) per row")
+        ("cell-size", bpo::value<unsigned>()->default_value(34), "size of each cell value in bytes")
+        ("collection-column", "add a non-frozen set<int> collection column")
+        ("collection-size", bpo::value<unsigned>()->default_value(10), "number of elements in the collection column")
         ("audit", bpo::value<std::string>(), "value for audit config entry")
         ("audit-keyspaces", bpo::value<std::string>(), "value for audit_keyspaces config entry")
         ("audit-tables", bpo::value<std::string>(), "value for audit_tables config entry")
@@ -333,6 +400,10 @@ int scylla_simple_query_main(int argc, char** argv) {
             cfg.query_single_key = app.configuration().contains("query-single-key");
             cfg.counters = app.configuration().contains("counters");
             cfg.flush_memtables = app.configuration().contains("flush");
+            cfg.cell_count = app.configuration()["cell-count"].as<unsigned>();
+            cfg.cell_size = app.configuration()["cell-size"].as<unsigned>();
+            cfg.collection_column = app.configuration().contains("collection-column");
+            cfg.collection_size = app.configuration()["collection-size"].as<unsigned>();
             if (app.configuration().contains("tablets")) {
                 cfg.initial_tablets = app.configuration()["initial-tablets"].as<unsigned>();
             }
