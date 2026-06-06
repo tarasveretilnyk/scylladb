@@ -1036,7 +1036,7 @@ public:
         do_apply(compaction_group_for_key(m.key(), m_schema), std::move(h), m, m_schema, *db::noop_large_data_guardrail::instance());
     }
     void apply(const mutation& m, db::rp_handle&& h = {}) {
-        do_apply(compaction_group_for_token(m.token()), std::move(h), m);
+        do_apply(compaction_group_for_token(m.token()), std::move(h), m, *db::noop_large_data_guardrail::instance());
     }
 
     future<> apply(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&& h,

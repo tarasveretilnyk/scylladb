@@ -2060,6 +2060,7 @@ table::try_flush_memtable_to_sstable(compaction_group& cg, lw_shared_ptr<memtabl
         for (const auto& sst : newtabs) {
             _large_data_guardrail->register_sstable(sst);
         }
+        _large_data_guardrail->on_flush();
 
         co_await utils::get_local_injector().inject("replica_post_flush_after_update_cache", [this] (auto& handler) -> future<> {
             const auto this_table_name = format("{}.{}", _schema->ks_name(), _schema->cf_name());
@@ -5033,11 +5034,11 @@ future<> table::apply(const mutation& m, db::rp_handle&& h, db::timeout_clock::t
     }
 
     return dirty_memory_region_group().run_when_memory_available([this, &m, h = std::move(h), &cg, holder = std::move(holder)] () mutable {
-        do_apply(cg, std::move(h), m);
+        do_apply(cg, std::move(h), m, *_large_data_guardrail);
     }, timeout);
 }
 
-template void table::do_apply(compaction_group& cg, db::rp_handle&&, const mutation&);
+template void table::do_apply(compaction_group& cg, db::rp_handle&&, const mutation&, db::large_data_guardrail_base&);
 
 future<> table::apply(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&& h,
                       db::timeout_clock::time_point timeout, shared_ptr<db::large_data_guardrail_base> guardrails) {
@@ -5058,7 +5059,7 @@ future<> table::apply(const frozen_mutation& m, schema_ptr m_schema, db::rp_hand
     }, timeout);
 }
 
-template void table::do_apply(compaction_group& cg, db::rp_handle&&, const frozen_mutation&, const schema_ptr&, const db::large_data_guardrail_base&);
+template void table::do_apply(compaction_group& cg, db::rp_handle&&, const frozen_mutation&, const schema_ptr&, db::large_data_guardrail_base&);
 
 future<>
 write_memtable_to_sstable(mutation_reader reader,

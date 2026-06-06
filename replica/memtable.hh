@@ -236,9 +236,12 @@ public:
     future<> apply(memtable&, reader_permit);
     // Applies mutation to this memtable.
     // The mutation is upgraded to current schema.
-    void apply(const mutation& m, db::rp_handle&& = {});
+    void apply(const mutation& m, db::large_data_guardrail_base& guardrails, db::rp_handle&& = {});
+    void apply(const mutation& m, db::rp_handle&& h = {}) {
+        apply(m, *db::noop_large_data_guardrail::instance(), std::move(h));
+    }
     void apply(const frozen_mutation& m, const schema_ptr& m_schema,
-               const db::large_data_guardrail_base& guardrails, db::rp_handle&& = {});
+               db::large_data_guardrail_base& guardrails, db::rp_handle&& = {});
     void apply(const frozen_mutation& m, const schema_ptr& m_schema, db::rp_handle&& h = {}) {
         apply(m, m_schema, *db::noop_large_data_guardrail::instance(), std::move(h));
     }
