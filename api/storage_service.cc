@@ -473,6 +473,12 @@ static sstables_loader::stream_scope parse_stream_scope(const sstring& scope_str
     throw httpd::bad_param_exception("invalid scope parameter value");
 }
 
+static future<json::json_return_type>
+rest_tablets_upload(http_context& ctx, sharded<sstables_loader>& sst_loader, std::unique_ptr<http::request> req);
+static
+future<json::json_return_type>
+rest_tablets_upload_abort(http_context& ctx, sharded<sstables_loader>& sst_loader, std::unique_ptr<http::request> req);
+
 void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>& sst_loader) {
     ss::load_new_ss_tables.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) {
         auto ks = validate_keyspace(ctx, req);
@@ -539,6 +545,12 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
+    ss::tablets_upload.set(r, [&ctx, &sst_loader] (std::unique_ptr<http::request> req) {
+        return rest_tablets_upload(ctx, sst_loader, std::move(req));
+    });
+    ss::tablets_upload_abort.set(r, [&ctx, &sst_loader] (std::unique_ptr<http::request> req) {
+        return rest_tablets_upload_abort(ctx, sst_loader, std::move(req));
+    });
     ss::tablet_aware_restore.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) -> future<json_return_type> {
         std::string keyspace = req->get_query_param("keyspace");
         std::string table = req->get_query_param("table");
@@ -589,6 +601,8 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
 void unset_sstables_loader(http_context& ctx, routes& r) {
     ss::load_new_ss_tables.unset(r);
     ss::start_restore.unset(r);
+    ss::tablets_upload.unset(r);
+    ss::tablets_upload_abort.unset(r);
     ss::tablet_aware_restore.unset(r);
 }
 
@@ -1799,6 +1813,60 @@ rest_repair_tablet(http_context& ctx, sharded<service::storage_service>& ss, std
         } catch (std::invalid_argument& e) {
             throw httpd::bad_param_exception(e.what());
         }
+}
+
+static
+future<json::json_return_type>
+rest_tablets_upload(http_context& ctx, sharded<sstables_loader>& sst_loader, std::unique_ptr<http::request> req) {
+    auto ks = req->get_query_param("ks");
+    auto table = req->get_query_param("table");
+    auto table_id = validate_table(ctx.db.local(), ks, table);
+
+    auto primary_replica_only = validate_bool_x(req->get_query_param("primary_replica_only"), false);
+
+    std::optional<size_t> tablet_count;
+    if (auto p = req->get_query_param("tablet_count"); !p.empty()) {
+        auto n = validate_int(p);
+        if (n <= 0) {
+            throw httpd::bad_param_exception("tablet_count must be positive");
+        }
+        tablet_count = size_t(n);
+    }
+
+    apilog.info("Cluster upload for {}.{} called. primary_replica_only={} tablet_count={}",
+            ks, table, primary_replica_only, tablet_count);
+    // A vnode table can never be uploaded this way; reject now instead of returning a doomed task.
+    if (!ctx.db.local().find_column_family(table_id).uses_tablets()) {
+        throw httpd::bad_param_exception(format("Table {}.{} does not use tablets; "
+                "use nodetool refresh on each node instead", ks, table));
+    }
+    try {
+        // Returns a task id rather than blocking: a load can run for hours and needs watching.
+        auto task_id = co_await sst_loader.local().upload_tablets_task(table_id, ks, table, tablet_count,
+                primary_replica_only);
+        co_return json::json_return_type(fmt::to_string(task_id));
+    } catch (std::invalid_argument& e) {
+        throw httpd::bad_param_exception(e.what());
+    }
+}
+
+static
+future<json::json_return_type>
+rest_tablets_upload_abort(http_context& ctx, sharded<sstables_loader>& sst_loader, std::unique_ptr<http::request> req) {
+    auto ks = req->get_query_param("ks");
+    auto table = req->get_query_param("table");
+    auto table_id = validate_table(ctx.db.local(), ks, table);
+
+    if (!ctx.db.local().find_column_family(table_id).uses_tablets()) {
+        throw httpd::bad_param_exception(format("Table {}.{} does not use tablets; "
+                "there is no cluster upload to abort", ks, table));
+    }
+
+    apilog.info("Cluster upload abort for {}.{} called", ks, table);
+    // Through the loader rather than storage_service: the request may not exist yet, in which
+    // case only the task that is about to create it can be told to stop.
+    co_await sst_loader.local().abort_upload(table_id);
+    co_return json_void();
 }
 
 static

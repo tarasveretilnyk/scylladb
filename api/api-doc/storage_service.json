@@ -1026,6 +1026,86 @@
          ]
       },
       {
+         "path":"/storage_service/tablets/upload/abort",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Cancels an in-flight cluster upload of a table",
+               "type":"void",
+               "nickname":"tablets_upload_abort",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Name of the keyspace being loaded into",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Name of the table being loaded into",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tablets/upload",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Loads SSTables from every node's upload directory into the cluster, scheduled by the tablet load balancer",
+               "type":"void",
+               "nickname":"tablets_upload",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Name of the keyspace to load into",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Name of the table to load into",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"primary_replica_only",
+                     "description":"Stream only to the primary replica of each tablet, leaving replication to a second pass",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"tablet_count",
+                     "description":"Resize the table to this many tablets and wait for the balancer before loading. Omit to load into the table's current tablet count",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"long",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
          "path":"/storage_service/keyspace_compaction/{keyspace}",
          "operations":[
             {
