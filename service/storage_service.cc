@@ -6068,6 +6068,124 @@ future<> storage_service::del_tablet_replica(table_id table, dht::token token, l
     });
 }
 
+future<> storage_service::abort_upload_tablets(table_id table) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.abort_upload_tablets(table);
+        });
+    }
+
+    slogger.info("Aborting cluster upload for table_id={}", table);
+    static const sstring abort_reason = "Cluster upload was aborted; the sstables that were "
+                                       "not consumed are left in the upload directories";
+    bool aborted_any = false;
+    while (true) {
+        auto guard = co_await get_guard_for_tablet_update();
+        group0_update_collector updates;
+        bool found = false;
+
+        // All of it in one command. Dropping the sessions in one command and recording the abort
+        // in a second left a window between them: the first commit wakes the coordinator, whose
+        // next pass could schedule fresh transitions - each with a session of its own - from work
+        // rows the second commit had not yet cleared, and nothing stopped those afterwards.
+        bool any_session = false;
+        if (get_token_metadata().tablets().has_tablet_map(table)) {
+            auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+            auto builder = tablet_mutation_builder_for_base_table(guard.write_timestamp(), table);
+            co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
+                auto* trinfo = tmap.get_tablet_transition_info(tid);
+                if (!trinfo || !trinfo->session_id) {
+                    co_return;
+                }
+                if (trinfo->transition != locator::tablet_transition_kind::upload &&
+                        trinfo->transition != locator::tablet_transition_kind::upload_replicate) {
+                    co_return;
+                }
+                auto last_token = tmap.get_last_token(tid);
+                // The executor's session_topology_guard turns dropping the session into an abort.
+                builder.del_session(last_token);
+                any_session = true;
+            });
+            if (any_session) {
+                co_await updates.add(builder.build());
+                found = true;
+            }
+        }
+
+        // Snapshot the ids: get_topology_request_entry() yields, and the sets are not iterated
+        // across that even though the guard keeps the topology in place.
+        std::vector<utils::UUID> ongoing(_topology_state_machine._topology.ongoing_upload_requests.begin(),
+                _topology_state_machine._topology.ongoing_upload_requests.end());
+        std::vector<utils::UUID> queued(_topology_state_machine._topology.global_requests_queue.begin(),
+                _topology_state_machine._topology.global_requests_queue.end());
+        for (auto req : ongoing) {
+            auto entry = co_await _sys_ks.local().get_topology_request_entry(req);
+            if (entry.upload_table_id == table) {
+                // Drop the remaining work, or the request keeps retrying it against closed sessions.
+                co_await updates.add(make_upload_work_clear_mutation(guard.write_timestamp(), req));
+                co_await updates.add(make_upload_tablet_state_clear_mutation(guard.write_timestamp(), req));
+                // Without a recorded outcome the request's completion is indistinguishable from
+                // success, and teardown would delete the sstables the abort stopped it loading.
+                updates.add(topology_request_tracking_mutation_builder(req)
+                        .set("error", abort_reason)
+                        .build());
+                found = true;
+            }
+        }
+        // Requests join ongoing_upload_requests only once prepared, so until then mark the
+        // tracking row and let the coordinator retire it. Dequeuing here would race it.
+        for (auto req : queued) {
+            auto entry = co_await _sys_ks.local().get_topology_request_entry(req);
+            auto* type = std::get_if<global_topology_request>(&entry.request_type);
+            if (!type || *type != global_topology_request::upload_tablets) {
+                continue;
+            }
+            if (entry.upload_table_id == table && entry.error.empty()) {
+                updates.add(topology_request_tracking_mutation_builder(req)
+                        .set("error", abort_reason)
+                        .build());
+                slogger.info("Cluster upload request {} for {} is not started yet; marked aborted "
+                        "so the coordinator retires it instead of starting it", req, table);
+                found = true;
+            }
+        }
+        if (!found) {
+            release_guard(std::move(guard));
+            break;
+        }
+        if (any_session) {
+            // Dropping sessions changes the tablet maps, so this bumps the topology version,
+            // which also wakes the coordinator to see the outcome right away.
+            sstring reason = format("Aborting cluster upload for table_id={}", table);
+            if (co_await exec_tablet_update(std::move(guard), std::move(updates), std::move(reason))) {
+                aborted_any = true;
+                break;
+            }
+            continue;
+        }
+        // Only the request rows changed. A version bump here would invalidate reads holding the
+        // current version - a prepare scan in flight compares per-shard versions and would fail
+        // with "tablet map moved" instead of the abort it is about to be told of.
+        topology_change change{co_await updates.collect()};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, "Abort cluster upload");
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            aborted_any = true;
+            break;
+        } catch (group0_concurrent_modification&) {
+            slogger.debug("abort_upload_tablets: concurrent modification, retrying");
+        }
+    }
+
+    if (aborted_any) {
+        slogger.info("Aborted cluster upload for table_id={}", table);
+    } else {
+        slogger.info("No cluster upload in progress for table_id={}, nothing to abort", table);
+    }
+}
+
 bool storage_service::is_upload_request_ongoing(utils::UUID request_id) const {
     return _topology_state_machine._topology.ongoing_upload_requests.contains(request_id);
 }
