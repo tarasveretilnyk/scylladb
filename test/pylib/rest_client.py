@@ -508,6 +508,43 @@ class ScyllaRESTAPIClient:
                   "load_and_stream": "true" if load_and_stream else "false"}
         await self.client.post(f"/storage_service/sstables/{keyspace}", host=node_ip, params=params)
 
+    async def tablets_upload(self, node_ip: str, keyspace: str, table: str, primary_replica_only: bool = False,
+                             tablet_count: Optional[int] = None, timeout: Optional[float] = None) -> str:
+        """Start a cluster-wide upload and return the id of the task tracking it.
+
+        Unlike load_new_sstables(), this is a cluster-wide operation and only needs to be
+        called on one node. It returns as soon as the task is created, so callers that
+        need the load to have finished must wait on the task."""
+        params = {"ks": keyspace, "table": table}
+        if primary_replica_only:
+            params["primary_replica_only"] = "true"
+        if tablet_count is not None:
+            params["tablet_count"] = str(tablet_count)
+        # Returns a task id; the load itself runs asynchronously.
+        return await self.client.post_json("/storage_service/tablets/upload", host=node_ip,
+                                           params=params, timeout=timeout)
+
+    async def tablets_upload_and_wait(self, node_ip: str, keyspace: str, table: str,
+                                      primary_replica_only: bool = False,
+                                      tablet_count: Optional[int] = None,
+                                      timeout: Optional[float] = None) -> None:
+        """Start a cluster upload and wait for its task, raising if the load failed."""
+        task_id = await self.tablets_upload(node_ip, keyspace, table,
+                                            primary_replica_only=primary_replica_only,
+                                            tablet_count=tablet_count, timeout=timeout)
+        status = await self.wait_task(node_ip, task_id)
+        if status is None:
+            raise RuntimeError(f"cluster upload task {task_id} disappeared")
+        if status['state'] != 'done':
+            raise RuntimeError(f"cluster upload task {task_id} ended in state "
+                               f"{status['state']}: {status.get('error')}")
+
+    async def tablets_upload_abort(self, node_ip: str, keyspace: str, table: str,
+                                   timeout: Optional[float] = None) -> None:
+        """Cancel an in-flight cluster upload of the table."""
+        params = {"ks": keyspace, "table": table}
+        await self.client.post("/storage_service/tablets/upload/abort", host=node_ip, params=params, timeout=timeout)
+
     async def drop_sstable_caches(self, node_ip: str) -> None:
         """Drop sstable caches"""
         await self.client.post(f"/system/drop_sstable_caches", host=node_ip)
