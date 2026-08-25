@@ -3745,6 +3745,23 @@ public:
         return selected;
     }
 
+    // Tables with an upload request in flight. Their tablet count must not move: a request's work
+    // list is keyed by tablet id against the count it was prepared with. The table comes from the
+    // request row - system.upload_work would mean pulling a whole work partition per pass.
+    future<std::unordered_set<table_id>> tables_with_ongoing_upload() {
+        std::unordered_set<table_id> result;
+        if (!ongoing_upload()) {
+            co_return result;
+        }
+        for (const auto& request_id : _topology->ongoing_upload_requests) {
+            auto entry = co_await _sys_ks->get_topology_request_entry(request_id);
+            if (entry.upload_table_id) {
+                result.insert(*entry.upload_table_id);
+            }
+        }
+        co_return result;
+    }
+
     future<table_resize_plan> make_resize_plan(const migration_plan& plan) {
         table_resize_plan resize_plan;
 
@@ -3752,12 +3769,23 @@ public:
             co_return std::move(resize_plan);
         }
 
+        auto uploading = co_await tables_with_ongoing_upload();
+
         auto table_sizing_plan = co_await make_sizing_plan();
 
         cluster_resize_load resize_load;
 
         for (auto&& [table, table_plan] : table_sizing_plan.tables) {
             auto& tmap = _tm->tablets().get_tablet_map(table);
+
+            if (uploading.contains(table)) {
+                // Skipping the table holds back more than new resize decisions: only tables passed
+                // to resize_load.update() are considered for finalizing or revoking one either.
+                // That is deliberate, since finalizing is what changes the tablet count. A resize
+                // caught mid-flight stays parked and completes once the request is done.
+                lblogger.debug("Skipping resize of {}: an upload request is in flight", table);
+                continue;
+            }
 
             if (!table_plan.avg_tablet_size) {
                 continue;
