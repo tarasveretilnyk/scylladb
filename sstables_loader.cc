@@ -16,6 +16,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/switch_to.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/rpc/rpc.hh>
 #include <seastar/util/short_streams.hh> 
 #include "sstables_loader.hh"
@@ -36,6 +37,12 @@
 #include "utils/error_injection.hh"
 #include "sstables_loader_helpers.hh"
 #include "db/system_distributed_keyspace.hh"
+#include "cql3/query_processor.hh"
+#include "streaming/stream_blob.hh"
+#include "db/view/view_update_checks.hh"
+#include "db/view/view_builder.hh"
+#include "db/view/view_building_worker.hh"
+#include "cql3/untyped_result_set.hh"
 #include "idl/sstables_loader.dist.hh"
 
 #include "sstables/object_storage_client.hh"
@@ -941,11 +948,200 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
             });
         });
     });
+    ser::sstables_loader_rpc_verbs::register_prepare_upload(&_messaging, [this] (rpc::opt_time_point, raft::server_id dst_id, ::table_id table) -> future<prepare_upload_response> {
+        return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), table] (auto&) {
+            return sl.local().prepare_upload(table);
+        });
+    });
 }
 
 future<> sstables_loader::stop() {
     co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
     co_await _task_manager_module->stop();
+}
+
+future<sstables_loader::upload_measurement> sstables_loader::measure_upload_slice(::table_id table_id,
+        std::vector<sstables::shared_sstable> ssts) {
+    upload_measurement out;
+    out.sstable_count = ssts.size();
+
+    // Named local: the tablet map below is borrowed from it and must not outlive it.
+    auto& tbl = _db.local().find_column_family(table_id);
+    auto erm = tbl.get_effective_replication_map();
+    out.topology_version = erm->get_token_metadata().get_version();
+    const auto& tmap = erm->get_token_metadata().tablets().get_tablet_map(table_id);
+
+    // Walk sstables rather than tablets: pairing every tablet against every sstable would be
+    // O(tablets x sstables) with an index probe per pair. Mapping first and last token to tablet
+    // ids bounds the work by real overlaps.
+    for (auto& sst : ssts) {
+        co_await coroutine::maybe_yield();
+
+        // A 'ka' component is named <ks>-<cf>-ka-<numeric generation>-<component>: neither the
+        // file-streaming rename nor pick_up_from_upload() can give it the generation a tablet
+        // table needs, and its numeric one collides across source nodes. Refused here, before
+        // any work exists, so the request fails with nothing consumed.
+        if (sst->get_version() == sstables::sstable_version_types::ka) {
+            throw std::runtime_error(fmt::format("{} is a legacy 'ka' format sstable, which cluster upload "
+                    "cannot rename into a tablet table; load it with nodetool refresh --load-and-stream instead",
+                    sst->get_filename()));
+        }
+
+        auto first = sst->get_first_decorated_key().token();
+        auto last = sst->get_last_decorated_key().token();
+        auto first_tablet = tmap.get_tablet_id(first);
+        auto last_tablet = tmap.get_tablet_id(last);
+
+        auto touch = [&] (locator::tablet_id id) -> upload_work_item& {
+            auto& item = out.items[id.value()];
+            item.tablet_id = id.value();
+            if (item.shards.empty()) {
+                item.shards.push_back(this_shard_id());
+                item.shard_bytes.push_back(0);
+            }
+            return item;
+        };
+
+        if (first_tablet == last_tablet) {
+            auto& item = touch(first_tablet);
+            item.estimated_bytes += sst->data_size();
+            item.shard_bytes.back() += sst->data_size();
+            continue;
+        }
+
+        // Probing the index per tablet costs a lookup - with BTI, I/O - per (sstable, tablet) pair,
+        // and sstables from a Cassandra node routinely span the whole ring. Apportion by token
+        // width beyond a few tablets; the scheduler treats these as estimates anyway.
+        constexpr uint64_t max_index_probes_per_sstable = 8;
+        auto tablets_spanned = last_tablet.value() - first_tablet.value() + 1;
+        bool probe = tablets_spanned <= max_index_probes_per_sstable;
+
+        auto sst_range = dht::token_range::make(first, last);
+
+        for (auto id = first_tablet; id <= last_tablet; id = locator::tablet_id(id.value() + 1)) {
+            co_await coroutine::maybe_yield();
+            auto& item = touch(id);
+            if (probe) {
+                auto bytes = co_await sst->estimated_data_size_for_range(tmap.get_token_range(id));
+                item.estimated_bytes += bytes;
+                item.shard_bytes.back() += bytes;
+                continue;
+            }
+            auto bytes = uint64_t(sst->data_size() * dht::overlap_ratio(sst_range, tmap.get_token_range(id)));
+            if (!bytes) {
+                continue;
+            }
+            item.estimated_bytes += bytes;
+            item.shard_bytes.back() += bytes;
+        }
+    }
+
+    co_return std::move(out);
+}
+
+// Waits for this node's own view of the tablet map to catch up - never for the coordinator to act,
+// which is why prepare_upload() cannot use await_topology_quiesced_and_get_erm(). That helper
+// waits until the coordinator observes an empty balance plan, but prepare_upload is a verb the
+// coordinator awaits on its own fiber, so the two deadlock and its main loop parks for good. A
+// read barrier plus a version comparison needs nothing from it, and the map cannot move while it
+// is parked here.
+future<locator::effective_replication_map_ptr> sstables_loader::await_local_tablet_map_caught_up(::table_id table_id) {
+    constexpr auto poll_interval = std::chrono::milliseconds(100);
+    constexpr auto max_attempts = 300;
+    for (int attempt = 0; ; attempt++) {
+        auto& t = _db.local().find_column_family(table_id);
+        auto erm = t.get_effective_replication_map();
+        if (!t.uses_tablets()) {
+            co_return erm;
+        }
+        if (co_await _ss.local().verify_topology_quiesced(erm->get_token_metadata().get_version())) {
+            co_return erm;
+        }
+        if (attempt >= max_attempts) {
+            throw std::runtime_error(fmt::format(
+                    "Timed out waiting for the tablet map of table {} to settle on this node; "
+                    "cluster upload cannot measure work against a moving map", table_id));
+        }
+        erm = nullptr;
+        co_await seastar::sleep(poll_interval);
+    }
+}
+
+future<prepare_upload_response> sstables_loader::prepare_upload(::table_id table_id) {
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [table_id] (sstables_loader& loader) {
+            return loader.prepare_upload(table_id);
+        });
+    }
+
+    auto units = co_await get_units(_prepare_upload_sem, 1);
+    co_await coroutine::switch_to(_sched_group);
+
+    // Measuring must observe the tablet boundaries the scheduler will later slice the work by;
+    // resize stays blocked for the request, so the map does not move in between. The directory is
+    // not frozen, though, and the work list is fixed here: files added after this are picked up
+    // only for tablets that happen to be scheduled anyway - a partial, silent inclusion.
+    auto erm = co_await await_local_tablet_map_caught_up(table_id);
+    auto& tbl = _db.local().find_column_family(table_id);
+    auto s = tbl.schema();
+
+    if (!tbl.uses_tablets()) {
+        throw std::runtime_error(fmt::format("Table {}.{} does not use tablets, cluster upload is not applicable",
+                s->ks_name(), s->cf_name()));
+    }
+
+    auto expected_topology_version = erm->get_token_metadata().get_version();
+
+    sstables::sstable_open_config cfg {
+        .load_bloom_filter = false,
+    };
+    // The only window in which a request is queued or preparing and no work rows exist yet.
+    // See upload_tablet_before_transport: the timeout aborts the node, so keep it unreachable.
+    co_await utils::get_local_injector().inject("upload_prepare_before_scan",
+            utils::wait_for_message(std::chrono::minutes(10)));
+
+    auto [tid, sstables_on_shards] = co_await replica::distributed_loader::get_sstables_from_upload_dir(
+            _db, s->ks_name(), s->cf_name(), cfg, /* need_mutate_level = */ false);
+
+    // Each slice was opened by that shard's sstables_manager and only that shard may touch it, so
+    // measure every slice on its owner and merge the tallies here.
+    std::vector<upload_measurement> per_shard(this_smp_shard_count());
+    co_await container().invoke_on_all([&per_shard, &sstables_on_shards, table_id] (sstables_loader& loader) -> future<> {
+        per_shard[this_shard_id()] = co_await loader.measure_upload_slice(table_id, std::move(sstables_on_shards[this_shard_id()]));
+    });
+
+    prepare_upload_response resp;
+
+    // One unit of work per (node, tablet), with the shards holding it collected into the item.
+    // Keying per shard too would multiply the group0 work list by the shard count.
+    std::map<uint64_t, upload_work_item> items;
+
+    for (shard_id shard = 0; shard < per_shard.size(); shard++) {
+        auto& m = per_shard[shard];
+        if (m.topology_version != expected_topology_version) {
+            throw std::runtime_error(fmt::format("Tablet map moved during the upload scan of {}.{}: "
+                    "shard {} measured against topology version {}, shard 0 against {}",
+                    s->ks_name(), s->cf_name(), shard, m.topology_version, expected_topology_version));
+        }
+        resp.sstable_count += m.sstable_count;
+        for (auto& [id, measured] : m.items) {
+            auto& item = items[id];
+            item.tablet_id = measured.tablet_id;
+            item.estimated_bytes += measured.estimated_bytes;
+            item.shards.insert(item.shards.end(), measured.shards.begin(), measured.shards.end());
+            item.shard_bytes.insert(item.shard_bytes.end(), measured.shard_bytes.begin(), measured.shard_bytes.end());
+        }
+    }
+
+    resp.items.reserve(items.size());
+    for (auto& [key, item] : items) {
+        resp.total_estimated_bytes += item.estimated_bytes;
+        resp.items.push_back(std::move(item));
+    }
+
+    llog.info("prepare_upload: table={}.{} sstables={} tablets_with_work={} estimated_bytes={}",
+            s->ks_name(), s->cf_name(), resp.sstable_count, resp.items.size(), resp.total_estimated_bytes);
+    co_return resp;
 }
 
 future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, sstring cf_name,

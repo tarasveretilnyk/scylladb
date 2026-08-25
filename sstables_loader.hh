@@ -9,12 +9,15 @@
 #pragma once
 
 #include <algorithm>
+#include <map>
 #include <vector>
 #include <seastar/core/sharded.hh>
 #include "dht/i_partitioner_fwd.hh"
 #include "dht/token.hh"
 #include "schema/schema_fwd.hh"
+#include "sstables/generation_type.hh"
 #include "sstables/shared_sstable.hh"
+#include "sstables/version.hh"
 #include "tasks/task_manager.hh"
 #include "db/consistency_level_type.hh"
 #include "locator/tablets.hh"
@@ -135,12 +138,30 @@ private:
     // ever arise.
     bool _loading_new_sstables = false;
 
+    // Serializes upload-directory scans. Only meaningful on shard 0, which
+    // prepare_upload() routes to: the scan starts a sharded sstable_directory over the
+    // whole upload directory, so two concurrent scans would open the same files twice.
+    // The coordinator may reissue PREPARE_UPLOAD on retry, so waiting is preferable to
+    // rejecting - a retry simply queues behind the scan already in flight.
+    seastar::semaphore _prepare_upload_sem{1};
     future<> load_and_stream(sstring ks_name, sstring cf_name,
             table_id, std::vector<sstables::shared_sstable> sstables,
             bool_class<struct primary_replica_only_tag> primary_replica_only, bool unlink_sstables, stream_scope scope,
             shared_ptr<stream_progress> progress);
 
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
+    future<seastar::shared_ptr<const locator::effective_replication_map>> await_local_tablet_map_caught_up(table_id table_id);
+
+    // One shard's contribution to the PREPARE_UPLOAD scan, keyed by tablet id.
+    struct upload_measurement {
+        std::map<uint64_t, upload_work_item> items;
+        uint32_t sstable_count = 0;
+        // Read per shard; the caller checks every shard saw the same one.
+        int64_t topology_version = 0;
+    };
+    // Must run on the shard whose sstables_manager opened these sstables.
+    future<upload_measurement> measure_upload_slice(table_id, std::vector<sstables::shared_sstable> ssts);
+    future<prepare_upload_response> prepare_upload(table_id);
     future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);
     future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
 
