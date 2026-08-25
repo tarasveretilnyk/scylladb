@@ -2418,6 +2418,34 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             }
         }
 
+        // A plain migration streams a tablet from its leaving replica to the pending one, so the
+        // pending replica ends up holding whatever phase 1 of an upload had put on the leaving one.
+        // The upload's primary has to follow, in the same command that installs the new replica
+        // set: left behind, the scheduler would find a primary that is no longer a replica and
+        // fail the request. Read here because the handler below cannot yield; only for tables
+        // whose map has a migration at end_migration this pass, which is rare.
+        using upload_tstate = std::unordered_map<uint64_t, db::system_keyspace::upload_tablet_state_entry>;
+        std::unordered_map<table_id, std::pair<utils::UUID, upload_tstate>> upload_state_for_table;
+        for (const auto& req_id : _topo_sm._topology.ongoing_upload_requests) {
+            auto req_entry = co_await _sys_ks.get_topology_request_entry(req_id);
+            if (!req_entry.upload_table_id) {
+                continue;
+            }
+            auto table = *req_entry.upload_table_id;
+            const auto& tablets = get_token_metadata().tablets();
+            if (!tablets.has_tablet_map(table)) {
+                continue;
+            }
+            bool migration_ending = std::ranges::any_of(tablets.get_tablet_map(table).transitions(), [] (const auto& t) {
+                return t.second.transition == locator::tablet_transition_kind::migration
+                        && t.second.stage == locator::tablet_transition_stage::end_migration;
+            });
+            if (!migration_ending) {
+                continue;
+            }
+            upload_state_for_table.emplace(table, std::pair(req_id, co_await _sys_ks.get_upload_tablet_state(req_id)));
+        }
+
         // We operate here on groups of co-located tablets.
         // The tablets of several tables may be co-located and share the same tablet map, and in
         // particular their transitions are shared. Therefore, each transition must be handled for
@@ -2462,6 +2490,13 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 if (do_barrier()) {
                     transition_to(stage);
                 }
+            };
+
+            // Every upload-kind arm ends a transition the same way, whether it finished, failed,
+            // or its request was retired; one spelling keeps the columns in lock-step.
+            auto clear_upload_transition = [&] {
+                _tablets.erase(gid);
+                get_mutation_builder().del_transition(last_token).del_upload_info(last_token).del_session(last_token);
             };
 
             auto check_excluded_replicas = [&] -> std::optional<sstring> {
@@ -2755,6 +2790,23 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                                 .set_replicas(last_token, trinfo.next)
                                 .del_migration_task_info(last_token, _feature_service);
                         _vb_coordinator->generate_tablet_migration_updates(updates, guard, tmap, gid, trinfo);
+                        // Uploads target base tables only, so the group's base table is the key.
+                        if (trinfo.transition == locator::tablet_transition_kind::migration) {
+                            if (auto it = upload_state_for_table.find(base_table); it != upload_state_for_table.end()) {
+                                const auto& [request_id, tstate] = it->second;
+                                auto leaving = locator::get_leaving_replica(tmap.get_tablet_info(gid.tablet), trinfo);
+                                auto st = tstate.find(gid.tablet.value());
+                                if (leaving && trinfo.pending_replica && st != tstate.end()
+                                        && st->second.phase != db::system_keyspace::upload_phase::done
+                                        && st->second.primary_host == leaving->host) {
+                                    rtlogger.info("Upload primary of tablet {} follows its migration from {} to {}",
+                                            gid, leaving->host, trinfo.pending_replica->host);
+                                    upload_tablet_state_mutation_builder sb(guard.write_timestamp(), request_id);
+                                    sb.set_primary_host(gid.tablet.value(), trinfo.pending_replica->host);
+                                    updates.add(canonical_mutation(sb.build()));
+                                }
+                            }
+                        }
                     }
                 }
                     break;
@@ -2866,10 +2918,137 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     }
                 }
                     break;
-                case locator::tablet_transition_stage::upload:
-                    [[fallthrough]];
-                case locator::tablet_transition_stage::upload_replicate:
-                    // Nothing creates these yet; the handlers arrive with the executor.
+                case locator::tablet_transition_stage::upload: {
+                    if (!trinfo.upload_info) {
+                        on_internal_error(rtlogger, format("Cannot handle upload transition without endpoints for tablet {}", gid));
+                    }
+                    auto ui = *trinfo.upload_info;
+                    auto request_id = ui.request_id;
+                    if (!_topo_sm._topology.ongoing_upload_requests.contains(request_id)) {
+                        // The request was retired (failed or aborted) with this transition still
+                        // pending. There is nothing to upload into any more, and the executor would
+                        // open a session for it that nothing tears down. Let a running action
+                        // resolve first, as clearing the session under it would detach the RPC.
+                        if (tablet_state.upload && !tablet_state.upload->available()) {
+                            break;
+                        }
+                        if (action_failed(tablet_state.upload)) {
+                            tablet_state.upload->ignore_ready_future();
+                        }
+                        rtlogger.warn("No ongoing upload request for {}, clearing upload transition", gid);
+                        clear_upload_transition();
+                        break;
+                    }
+
+                    if (action_failed(tablet_state.upload)) {
+                        auto ep = tablet_state.upload->get_exception();
+                        rtlogger.debug("Clearing upload transition for {} due to error", gid);
+                        clear_upload_transition();
+                        // Leave the work row in place. Clearing only the transition lets the
+                        // scheduler retry this slice, possibly from another source node, and
+                        // an upload that keeps failing surfaces as a stalled request rather
+                        // than as silently dropped data.
+                        updates.add(
+                            topology_request_tracking_mutation_builder(request_id)
+                                .set("error", format("Upload failed for tablet {}: {}", gid, ep))
+                                .build());
+                        break;
+                    }
+
+                    // The session was written by the command that set this stage, and a node
+                    // validates it against its own tablet metadata, so the RPC needs a barrier.
+                    if (!do_barrier()) {
+                        break;
+                    }
+
+                    if (advance_in_background(gid, tablet_state.upload, "upload", [this, gid, ui] () -> future<> {
+                        auto dst = raft::server_id(ui.source_host.uuid());
+                        if (is_excluded(dst)) {
+                            throw std::runtime_error(format("Upload source {} is excluded", ui.source_host));
+                        }
+                        rtlogger.info("Uploading tablet={} from {} shards {}", gid, ui.source_host,
+                                fmt::join(ui.source_shards, ","));
+                        co_await ser::sstables_loader_rpc_verbs::send_upload_tablet(&_messaging, ui.source_host, dst, gid,
+                                ui.source_shards | std::ranges::to<std::vector<uint32_t>>());
+                        rtlogger.debug("Tablet {} uploaded from {}", gid, ui.source_host);
+                    })) {
+                        rtlogger.debug("Clearing upload transition for {}", gid);
+                        clear_upload_transition();
+                        // Eligible again next pass if other nodes still hold data for it.
+                        upload_work_mutation_builder wb(guard.write_timestamp(), request_id);
+                        wb.del_work(gid.tablet.value(), ui.source_host);
+                        updates.add(canonical_mutation(wb.build()));
+                    }
+                }
+                    break;
+                case locator::tablet_transition_stage::upload_replicate: {
+                    if (!trinfo.upload_info) {
+                        on_internal_error(rtlogger, format("Cannot handle upload_replicate without endpoints for tablet {}", gid));
+                    }
+                    auto ui = *trinfo.upload_info;
+                    // The transition carries the request id, so no table -> request map is needed.
+                    auto request_id = ui.request_id;
+                    if (!_topo_sm._topology.ongoing_upload_requests.contains(request_id)) {
+                        // Let a running replicate action resolve first: clearing the transition
+                        // and its session under a live pull would detach the RPC.
+                        if (tablet_state.upload && !tablet_state.upload->available()) {
+                            break;
+                        }
+                        // Consume it before the erase drops the holder, or seastar warns.
+                        if (action_failed(tablet_state.upload)) {
+                            tablet_state.upload->ignore_ready_future();
+                        }
+                        rtlogger.warn("No ongoing upload request for {}, clearing replicate transition", gid);
+                        clear_upload_transition();
+                        break;
+                    }
+
+                    if (action_failed(tablet_state.upload)) {
+                        auto ep = tablet_state.upload->get_exception();
+                        // The phase stays at replicating so the scheduler retries; marking it
+                        // done would report success with the data still only on the primary.
+                        rtlogger.warn("Upload replication of tablet {} failed, will retry: {}", gid, ep);
+                        clear_upload_transition();
+                        // The phase stays at replicating, so the scheduler retries after its
+                        // backoff. Marking it done here would leave the data on the primary
+                        // alone while reporting success.
+                        updates.add(
+                            topology_request_tracking_mutation_builder(request_id)
+                                .set("error", format("Upload replication failed for tablet {}: {}", gid, ep))
+                                .build());
+                        break;
+                    }
+
+                    // Same as phase 1, but here it is the primary that validates the session.
+                    if (!do_barrier()) {
+                        break;
+                    }
+
+                    auto& tinfo = tmap.get_tablet_info(gid.tablet);
+                    auto replicas = tinfo.replicas;
+                    if (advance_in_background(gid, tablet_state.upload, "upload_replicate", [this, gid, ui, replicas] () -> future<> {
+                        // Replicas pull from the primary by file streaming rather than re-sending
+                        // mutations to each; the destination drives, as in tablet migration.
+                        co_await coroutine::parallel_for_each(replicas, [this, gid, ui] (locator::tablet_replica r) -> future<> {
+                            if (r.host == ui.primary_host) {
+                                co_return;
+                            }
+                            auto dst = raft::server_id(r.host.uuid());
+                            if (is_excluded(dst)) {
+                                throw std::runtime_error(format("Replication target {} is excluded", r.host));
+                            }
+                            rtlogger.info("Replicating uploaded tablet={} from {} to {}", gid, ui.primary_host, r);
+                            co_await ser::sstables_loader_rpc_verbs::send_upload_replicate_tablet(
+                                    &_messaging, r.host, dst, gid, r.shard);
+                        });
+                    })) {
+                        rtlogger.debug("Clearing upload_replicate transition for {}", gid);
+                        clear_upload_transition();
+                        upload_tablet_state_mutation_builder sb(guard.write_timestamp(), request_id);
+                        sb.set_phase(gid.tablet.value(), db::system_keyspace::upload_phase::done);
+                        updates.add(canonical_mutation(sb.build()));
+                    }
+                }
                     break;
                 case locator::tablet_transition_stage::restore: {
                     if (trinfo.snapshot_name.empty()) {
