@@ -1218,6 +1218,80 @@ SEASTAR_TEST_CASE(test_key_count_estimation) {
     });
 }
 
+SEASTAR_TEST_CASE(test_data_size_estimation) {
+    return test_env::do_with_async([] (test_env& env) {
+        for (const auto version : writable_sstable_versions) {
+            auto s = schema_builder(this_smp_shard_count(), "ks", "cf")
+                .with_column("pk", bytes_type, column_kind::partition_key)
+                .with_column("v", int32_type)
+                .build();
+
+            int count = 10'000;
+            std::vector<dht::decorated_key> all_pks = tests::generate_partition_keys(count + 2, s, local_shard_only::yes, tests::key_size{8, 8});
+            std::vector<dht::decorated_key> pks(all_pks.begin() + 1, all_pks.end() - 1);
+            auto mt = make_lw_shared<replica::memtable>(s);
+            for (auto pk : pks) {
+                mutation m(s, pk);
+                m.set_clustered_cell(clustering_key::make_empty(), bytes("v"), data_value(int32_t(1)), 1 /* ts */);
+                mt->apply(m);
+            }
+
+            auto _ = env.tempdir().make_sweeper();
+            shared_sstable sst = make_sstable_easy(env, mt, env.manager().configure_writer(), version, pks.size());
+
+            const auto total = sst->data_size();
+            BOOST_REQUIRE_GT(total, 0u);
+
+            {
+                auto est = sst->estimated_data_size_for_range(dht::token_range::make_open_ended_both_sides()).get();
+                testlog.trace("data_est([-inf; +inf]) = {}, data_size = {}", est, total);
+                BOOST_REQUIRE_EQUAL(est, total);
+            }
+
+            {
+                auto r = dht::token_range::make(all_pks[0].token(), all_pks[0].token());
+                BOOST_REQUIRE_EQUAL(sst->estimated_data_size_for_range(r).get(), 0u);
+            }
+
+            {
+                auto r = dht::token_range::make(all_pks.back().token(), all_pks.back().token());
+                BOOST_REQUIRE_EQUAL(sst->estimated_data_size_for_range(r).get(), 0u);
+            }
+
+            uint64_t prev = 0;
+            for (int size : {1, 64, 256, 512, 1024, 4096, count}) {
+                auto r = dht::token_range::make(pks[0].token(), pks[size - 1].token());
+                auto est = sst->estimated_data_size_for_range(r).get();
+                testlog.trace("data_est([0; {}]) = {}", size - 1, est);
+                BOOST_REQUIRE_GT(est, 0u);
+                BOOST_REQUIRE_LE(est, total);
+                BOOST_REQUIRE_GE(est, prev);
+                prev = est;
+            }
+
+            {
+                auto r = dht::token_range::make(pks[2500].token(), pks[7500].token());
+                auto est = sst->estimated_data_size_for_range(r).get();
+                testlog.trace("data_est([2500; 7500]) = {} of {}", est, total);
+                BOOST_REQUIRE_LE(est, total);
+                BOOST_REQUIRE_GT(est, total / 10);
+            }
+
+            // Both estimators come from the same index lookup and must agree on whether a range
+            // holds anything - the upload scheduler treats zero as "no work".
+            for (int lower : {0, 100, 2500, 9000}) {
+                for (int size : {1, 64, 1024}) {
+                    auto upper = std::min(count - 1, lower + size - 1);
+                    auto r = dht::token_range::make(pks[lower].token(), pks[upper].token());
+                    auto keys = sst->estimated_keys_for_range(r).get();
+                    auto bytes = sst->estimated_data_size_for_range(r).get();
+                    BOOST_REQUIRE_EQUAL(keys == 0, bytes == 0);
+                }
+            }
+        }
+    });
+}
+
 SEASTAR_TEST_CASE(test_large_index_pages_do_not_cause_large_allocations) {
   return test_env::do_with_async([] (test_env& env) {
     // We create a sequence of partitions such that first we have a partition with a very long key, then
