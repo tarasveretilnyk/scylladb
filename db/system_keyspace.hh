@@ -18,6 +18,7 @@
 #include "gms/gossiper.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/UUID.hh"
+#include "utils/small_vector.hh"
 #include "query/query-result-set.hh"
 #include "db_clock.hh"
 #include "mutation_query.hh"
@@ -196,6 +197,8 @@ public:
     static constexpr auto RAFT_GROUPS_SNAPSHOT_CONFIG = "raft_groups_snapshot_config";
     static constexpr auto REPAIR_HISTORY = "repair_history";
     static constexpr auto REPAIR_TASKS = "repair_tasks";
+    static constexpr auto UPLOAD_WORK = "upload_work";
+    static constexpr auto UPLOAD_TABLET_STATE = "upload_tablet_state";
     static constexpr auto GROUP0_HISTORY = "group0_history";
     static constexpr auto DISCOVERY = "discovery";
     static constexpr auto TOPOLOGY = "topology";
@@ -252,6 +255,8 @@ public:
     static schema_ptr raft_groups_snapshot_config();
     static schema_ptr repair_history();
     static schema_ptr repair_tasks();
+    static schema_ptr upload_work();
+    static schema_ptr upload_tablet_state();
     static schema_ptr group0_history();
     static schema_ptr discovery();
     static schema_ptr topology();
@@ -440,6 +445,37 @@ public:
     future<mutation> get_update_repair_task_mutation(const repair_task_entry& entry, api::timestamp_type ts);
     using repair_task_consumer = noncopyable_function<future<>(const repair_task_entry&)>;
     future<> get_repair_task(tasks::task_id task_uuid, repair_task_consumer f);
+
+    struct upload_work_entry {
+        uint64_t tablet_id;
+        locator::host_id host;
+        utils::small_vector<shard_id, 4> shards;
+        utils::small_vector<uint64_t, 4> shard_bytes;
+        uint64_t estimated_bytes;
+    };
+    // Remaining work of one upload request; an empty result means the request is finished.
+    struct upload_work_list {
+        utils::chunked_vector<upload_work_entry> entries;
+    };
+    future<upload_work_list> get_upload_work(utils::UUID request_id);
+    // tablet_id is the first clustering column, so this is one cheap contiguous slice.
+    future<upload_work_list> get_upload_work_for_tablet(utils::UUID request_id, uint64_t tablet_id);
+
+    // Phase 2 needs recording: a tablet with no work left otherwise looks like one that replicated.
+    enum class upload_phase {
+        uploading,   // work outstanding
+        replicating, // uploaded to the primary, not yet on the other replicas
+        done,
+    };
+    static sstring upload_phase_to_string(upload_phase);
+    static upload_phase upload_phase_from_string(const sstring&);
+
+    struct upload_tablet_state_entry {
+        uint64_t tablet_id;
+        std::optional<locator::host_id> primary_host;
+        upload_phase phase = upload_phase::uploading;
+    };
+    future<std::unordered_map<uint64_t, upload_tablet_state_entry>> get_upload_tablet_state(utils::UUID request_id);
 
     future<> save_truncation_record(const replica::column_family&, db_clock::time_point truncated_at, db::replay_position);
     future<replay_positions> get_truncated_positions(table_id);

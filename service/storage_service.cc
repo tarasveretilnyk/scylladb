@@ -6842,6 +6842,12 @@ void storage_service::init_messaging_service() {
                 if (ss._feature_service.client_routes) {
                     additional_tables.push_back(db::system_keyspace::client_routes()->id());
                 }
+                if (ss._feature_service.tablet_upload) {
+                    // Without these a node that joins mid-upload, then becomes coordinator, reads
+                    // an empty work list, reports success and has every node delete its sstables.
+                    additional_tables.push_back(db::system_keyspace::upload_work()->id());
+                    additional_tables.push_back(db::system_keyspace::upload_tablet_state()->id());
+                }
             }
 
             for (const auto& table : boost::join(params.tables, additional_tables)) {

@@ -53,6 +53,7 @@
 #include "replica/tablets.hh"
 #include "replica/query.hh"
 #include "types/types.hh"
+#include "types/list.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "message/shared_dict.hh"
 #include "replica/database.hh"
@@ -127,6 +128,8 @@ namespace {
                 system_keyspace::VIEW_BUILDING_TASKS,
                 system_keyspace::CLIENT_ROUTES,
                 system_keyspace::REPAIR_TASKS,
+                system_keyspace::UPLOAD_WORK,
+                system_keyspace::UPLOAD_TABLET_STATE,
             };
             if (builder.ks_name() == system_keyspace::NAME && tables.contains(builder.cf_name())) {
                 builder.set_is_group0_table();
@@ -482,6 +485,81 @@ schema_ptr system_keyspace::repair_tasks() {
             .build();
     }();
     return schema;
+}
+
+schema_ptr system_keyspace::upload_work() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, UPLOAD_WORK);
+        return schema_builder(this_smp_shard_count(), NAME, UPLOAD_WORK, std::optional(id))
+            // One partition per upload request; each row is one source node's slice of one tablet.
+            // Not keyed by shard as well: that would multiply the list by the shard count.
+            .with_column("request_id", timeuuid_type, column_kind::partition_key)
+            .with_column("tablet_id", long_type, column_kind::clustering_key)
+            .with_column("host_id", uuid_type, column_kind::clustering_key)
+            // Estimated, not exact - see sstable::estimated_data_size_for_range(). The scheduler
+            // re-reads what is left rather than trusting it, so an error costs efficiency only.
+            .with_column("estimated_bytes", long_type)
+            // Shards of host_id with overlapping sstables; only the opening shard can read one.
+            .with_column("shards", list_type_impl::get_instance(int32_type, false))
+            // Per-shard share of estimated_bytes; charging the tablet total would throttle a load.
+            .with_column("shard_bytes", list_type_impl::get_instance(long_type, false))
+            .set_comment("Remaining per-node, per-tablet work of cluster upload requests")
+            .with_hash_version()
+            .build();
+    }();
+    return schema;
+}
+
+schema_ptr system_keyspace::upload_tablet_state() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, UPLOAD_TABLET_STATE);
+        return schema_builder(this_smp_shard_count(), NAME, UPLOAD_TABLET_STATE, std::optional(id))
+            // Scoped to the request, so finishing or aborting drops all of it in one tombstone.
+            .with_column("request_id", timeuuid_type, column_kind::partition_key)
+            .with_column("tablet_id", long_type, column_kind::clustering_key)
+            // A host, not an index into the replica list: tablets keep migrating mid-upload.
+            .with_column("primary_host", uuid_type)
+            .with_column("phase", utf8_type)
+            .set_comment("Per-tablet state of cluster upload requests")
+            .with_hash_version()
+            .build();
+    }();
+    return schema;
+}
+
+sstring system_keyspace::upload_phase_to_string(upload_phase p) {
+    switch (p) {
+    case upload_phase::uploading: return "uploading";
+    case upload_phase::replicating: return "replicating";
+    case upload_phase::done: return "done";
+    }
+    on_internal_error(slogger, format("Invalid upload phase: {}", static_cast<int>(p)));
+}
+
+system_keyspace::upload_phase system_keyspace::upload_phase_from_string(const sstring& s) {
+    if (s == "uploading") return upload_phase::uploading;
+    if (s == "replicating") return upload_phase::replicating;
+    if (s == "done") return upload_phase::done;
+    on_internal_error(slogger, format("Invalid upload phase: {}", s));
+}
+
+future<std::unordered_map<uint64_t, system_keyspace::upload_tablet_state_entry>>
+system_keyspace::get_upload_tablet_state(utils::UUID request_id) {
+    std::unordered_map<uint64_t, upload_tablet_state_entry> result;
+    sstring req = format("SELECT * FROM system.{} WHERE request_id = {}", UPLOAD_TABLET_STATE, request_id);
+    co_await _qp.query_internal(req, [&result] (const cql3::untyped_result_set::row& row) -> future<stop_iteration> {
+        upload_tablet_state_entry e;
+        e.tablet_id = uint64_t(row.get_as<int64_t>("tablet_id"));
+        if (row.has("primary_host")) {
+            e.primary_host = locator::host_id(row.get_as<utils::UUID>("primary_host"));
+        }
+        if (row.has("phase")) {
+            e.phase = upload_phase_from_string(row.get_as<sstring>("phase"));
+        }
+        result.emplace(e.tablet_id, std::move(e));
+        co_return stop_iteration::no;
+    });
+    co_return result;
 }
 
 schema_ptr system_keyspace::built_indexes() {
@@ -2254,6 +2332,8 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     scylla_local(), db::schema_tables::scylla_table_schema_history(),
                     repair_history(),
                     repair_tasks(),
+                    upload_work(),
+                    upload_tablet_state(),
                     views_builds_in_progress(), built_views(),
                     scylla_views_builds_in_progress(),
                     truncated(),
@@ -2481,6 +2561,54 @@ future<> system_keyspace::get_compaction_history(compaction_history_consumer con
 future<> system_keyspace::update_repair_history(repair_history_entry entry) {
     sstring req = format("INSERT INTO system.{} (table_uuid, repair_time, repair_uuid, keyspace_name, table_name, range_start, range_end) VALUES (?, ?, ?, ?, ?, ?, ?)", REPAIR_HISTORY);
     co_await execute_cql(req, entry.table_uuid.uuid(), entry.ts, entry.id.uuid(), entry.ks, entry.cf, entry.range_start, entry.range_end).discard_result();
+}
+
+static future<> read_upload_work_rows(cql3::query_processor& qp, sstring req,
+        system_keyspace::upload_work_list& result) {
+    co_await qp.query_internal(req, [&result] (const cql3::untyped_result_set::row& row) -> future<stop_iteration> {
+        utils::small_vector<shard_id, 4> shards;
+        if (row.has("shards")) {
+            for (auto s : row.get_list<int32_t>("shards")) {
+                shards.push_back(shard_id(s));
+            }
+        }
+        utils::small_vector<uint64_t, 4> shard_bytes;
+        if (row.has("shard_bytes")) {
+            for (auto b : row.get_list<int64_t>("shard_bytes")) {
+                shard_bytes.push_back(uint64_t(b));
+            }
+        }
+        auto estimated_bytes = uint64_t(row.get_as<int64_t>("estimated_bytes"));
+        // The scheduler indexes one by the other, so a misaligned row falls back to an even split.
+        if (shard_bytes.size() != shards.size()) {
+            shard_bytes.clear();
+            shard_bytes.resize(shards.size(), shards.empty() ? 0 : estimated_bytes / shards.size());
+        }
+        result.entries.push_back(system_keyspace::upload_work_entry{
+            .tablet_id = uint64_t(row.get_as<int64_t>("tablet_id")),
+            .host = locator::host_id(row.get_as<utils::UUID>("host_id")),
+            .shards = std::move(shards),
+            .shard_bytes = std::move(shard_bytes),
+            .estimated_bytes = estimated_bytes,
+        });
+        co_return stop_iteration::no;
+    });
+}
+
+future<system_keyspace::upload_work_list> system_keyspace::get_upload_work(utils::UUID request_id) {
+    upload_work_list result;
+    co_await read_upload_work_rows(_qp,
+            format("SELECT * FROM system.{} WHERE request_id = {}", UPLOAD_WORK, request_id), result);
+    co_return result;
+}
+
+future<system_keyspace::upload_work_list> system_keyspace::get_upload_work_for_tablet(
+        utils::UUID request_id, uint64_t tablet_id) {
+    upload_work_list result;
+    co_await read_upload_work_rows(_qp,
+            format("SELECT * FROM system.{} WHERE request_id = {} AND tablet_id = {}",
+                    UPLOAD_WORK, request_id, int64_t(tablet_id)), result);
+    co_return result;
 }
 
 future<> system_keyspace::get_repair_history(::table_id table_id, repair_history_consumer f) {
