@@ -973,6 +973,13 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
             return sl.local().do_upload_replicate_tablet(gid, dst_shard);
         });
     });
+    ser::sstables_loader_rpc_verbs::register_finish_upload(&_messaging, [this] (rpc::opt_time_point, raft::server_id dst_id, utils::UUID request_id, bool unlink_consumed) -> future<finish_upload_result> {
+        return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), request_id, unlink_consumed] (auto&) {
+            return sl.local().finish_upload(request_id, unlink_consumed);
+        }).then([] {
+            return make_ready_future<finish_upload_result>();
+        });
+    });
     ser::sstables_loader_rpc_verbs::register_upload_tablet(&_messaging, [this] (raft::server_id dst_id, locator::global_tablet_id gid, std::vector<uint32_t> source_shards) -> future<upload_tablet_result> {
         return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), gid, source_shards = std::move(source_shards)] (auto&) mutable {
             return sl.local().do_upload_tablet(gid, std::move(source_shards));
@@ -983,6 +990,7 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
 future<> sstables_loader::stop() {
     co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
     co_await _task_manager_module->stop();
+    _upload_sessions.clear();
 }
 
 // Where an uploaded sstable of this table lands: past the view-update path it is a normal
@@ -1012,6 +1020,14 @@ future<> sstables_loader::ensure_upload_session(utils::UUID request_id, ::table_
         throw std::runtime_error(fmt::format(
                 "Upload request {} is being torn down", request_id));
     }
+    // A transition created just before its request was retired can arrive after FINISH_UPLOAD
+    // has torn the sessions down. Opening one for it would ingest a slice of a retired load
+    // into a session nothing tears down. The coordinator barriers before it sends, so the
+    // applied group0 state here is current enough to say whether the request still runs.
+    if (!_ss.local().is_upload_request_ongoing(request_id)) {
+        throw std::runtime_error(fmt::format(
+                "Upload request {} is no longer ongoing", request_id));
+    }
 
     auto& tbl = _db.local().find_column_family(table_id);
     auto s = tbl.schema();
@@ -1036,55 +1052,99 @@ future<> sstables_loader::ensure_upload_session(utils::UUID request_id, ::table_
 
 future<> sstables_loader::finish_upload(utils::UUID request_id, bool unlink_consumed) {
     if (this_shard_id() != 0) {
-        // Driven from shard 0 so it can take _prepare_upload_sem below.
         co_return co_await container().invoke_on(0, [request_id, unlink_consumed] (sstables_loader& loader) {
             return loader.finish_upload(request_id, unlink_consumed);
         });
     }
 
-    // Serialised against ensure_upload_session(), which holds this while it scans the upload
-    // directory. Without that, a FINISH_UPLOAD arriving mid-scan finds no session to tear down
-    // - the scan has not published one yet - reports success, and the scan then emplaces
-    // sessions on every shard that nothing will ever ask about again, because the request is
-    // retired by then. Every shard would hold the whole upload directory open, sstables and
-    // file handles included, for the life of the process. Reachable whenever a request is
-    // completed while a node is starting its first transition for it: a source node leaving,
-    // or an abort.
-    auto units = co_await get_units(_prepare_upload_sem, 1);
+    // Unpublish under the semaphore, tear down outside it.
+    //
+    // Unpublishing races ensure_upload_session(), which holds the semaphore while it scans: without
+    // it a FINISH_UPLOAD arriving mid-scan finds no session to tear down, and the scan then
+    // publishes sessions nothing will ever ask about again. The teardown must not hold it: it
+    // waits on attach_gate, and prepare_upload() takes the same semaphore from a verb the
+    // coordinator awaits.
+    {
+        auto units = co_await get_units(_prepare_upload_sem, 1);
+        co_await container().invoke_on_all([request_id] (sstables_loader& loader) {
+            auto it = loader._upload_sessions.find(request_id);
+            if (it == loader._upload_sessions.end()) {
+                return;
+            }
+            loader._draining_upload_sessions.insert_or_assign(request_id, std::move(it->second));
+            loader._upload_sessions.erase(it);
+        });
+    }
 
-    // Every shard holds its own slice of the request's opened upload directory, so the
-    // teardown has to reach all of them. Idempotent: a request that was already cleaned
-    // up, or one this node never had work for, is a no-op.
     co_await container().invoke_on_all([request_id, unlink_consumed] (sstables_loader& loader) -> future<> {
-        auto it = loader._upload_sessions.find(request_id);
-        if (it == loader._upload_sessions.end()) {
+        auto it = loader._draining_upload_sessions.find(request_id);
+        if (it == loader._draining_upload_sessions.end()) {
             co_return;
         }
-        auto session = std::move(it->second);
-        loader._upload_sessions.erase(it);
+        // The entry stays, emptied, until this teardown is done. Erasing it up front made the
+        // guard in ensure_upload_session() dead: this lambda runs on shard 0 synchronously up to
+        // its first suspension, so a waiter let in by the semaphore's release above found neither
+        // map holding the request and rescanned the directory for a request being torn down.
+        // Emptied rather than kept whole so a second FINISH_UPLOAD does not tear down twice.
+        auto session = std::exchange(it->second, nullptr);
+        if (!session) {
+            co_return;
+        }
+        auto forget = seastar::defer([&loader, request_id] () noexcept {
+            loader._draining_upload_sessions.erase(request_id);
+        });
+
+        // The session is out of the published map and the gate waits for an attach already
+        // running. Only past both does pending_attach mean what the branch below needs - a file
+        // moved out of the upload directory and in no sstable set.
+        co_await session->attach_gate.close();
 
         if (!unlink_consumed) {
-            // Aborted or failed: leave the files where they are so the operator can retry
-            // or inspect them. Dropping the session is still right - a retry rescans. Nothing
-            // here is marked for deletion, so letting the session go really does leave them.
-            llog.info("Upload request {} torn down on shard {}, {} sstables left in place",
-                    request_id, this_shard_id(), session->sstables.size());
+            // Aborted or failed: leave what is still in the upload directory for the operator.
+            // What an attach already moved out is different - it sits in the table's directory in no
+            // sstable set, marked consumed so no rescan finds it, and would be adopted on the next
+            // restart, resurrecting a slice of an aborted load.
+            size_t removed = 0;
+            for (auto& entry : session->pending_attach) {
+                for (auto& m : entry.second) {
+                    try {
+                        removed += co_await loader.container().invoke_on(m.owning_shard,
+                                [table = session->table, m] (sstables_loader& owner) -> future<size_t> {
+                            auto& tbl = owner._db.local().find_column_family(table);
+                            // With attach_gate closed this cannot be in the sstable set, and
+                            // unlinking it if it were would destroy live data.
+                            auto all_sstables = tbl.get_sstables();
+                            for (const auto& sst : *all_sstables) {
+                                if (sst->generation() == m.generation) {
+                                    llog.error("Refusing to remove upload sstable (generation {}) of table "
+                                            "{}: it is attached to the table, which a torn-down pending "
+                                            "attach must never be", m.generation, table);
+                                    co_return 0;
+                                }
+                            }
+                            auto erm = tbl.get_effective_replication_map();
+                            auto sst = tbl.get_sstables_manager().make_sstable(tbl.schema(),
+                                    tbl.get_storage_options(), m.generation, m.state, m.version, m.format);
+                            co_await sst->load(erm->get_sharder(*tbl.schema()));
+                            co_await sst->unlink();
+                            co_return 1;
+                        });
+                    } catch (...) {
+                        llog.warn("Failed to remove orphaned upload sstable (generation {}) of table {}: {}",
+                                m.generation, session->table, std::current_exception());
+                    }
+                }
+            }
+            llog.info("Upload request {} torn down on shard {}, {} sstables left in the upload "
+                    "directory, {} orphaned attach(es) removed",
+                    request_id, this_shard_id(), session->sstables.size(), removed);
             co_return;
         }
 
-        // Sstables wholly inside one tablet were unlinked as their transition streamed.
-        // The rest were only recorded, because neighbouring tablets still needed them, and
-        // this is the first point at which no remaining work can reference them. This
-        // mirrors node-local load-and-stream, which likewise unlinks only once every
-        // tablet has been streamed.
         size_t marked = 0;
         for (auto& sst : session->sstables) {
-            // Skip anything already handled incrementally as its last overlapping tablet
-            // finished; only the leftovers of an incomplete request remain here.
             if (session->streamed.contains(sst.get()) && !session->unlinked.contains(sst.get())) {
                 marked++;
-                // Deferred, not an immediate unlink: a concurrent reader may hold a reference
-                // to the same object. Removal follows the last reference, as compaction does.
                 sst->mark_for_deletion();
                 session->unlinked.insert(sst.get());
             }
