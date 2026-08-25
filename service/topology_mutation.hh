@@ -16,6 +16,7 @@
 #include <seastar/core/sstring.hh>
 
 #include "dht/token.hh"
+#include "locator/host_id.hh"
 #include "mutation/canonical_mutation.hh"
 #include "mutation/mutation.hh"
 #include "schema/schema.hh"
@@ -173,6 +174,53 @@ public:
 
     canonical_mutation build() { return canonical_mutation{std::move(_m)}; }
 };
+
+/// One unit of cluster-upload work: one source node's upload data overlapping one tablet.
+struct upload_work_row {
+    uint64_t tablet_id = 0;
+    locator::host_id host;
+    utils::small_vector<shard_id, 4> shards;
+    // Aligned with shards: each shard's contribution to estimated_bytes.
+    utils::small_vector<uint64_t, 4> shard_bytes;
+    uint64_t estimated_bytes = 0;
+};
+
+/// The nodes x tablets work list can outgrow one group0 command; callers split across builders.
+class upload_work_mutation_builder {
+    api::timestamp_type _ts;
+    schema_ptr _s;
+    mutation _m;
+private:
+    clustering_key get_ck(uint64_t tablet_id, locator::host_id) const;
+public:
+    upload_work_mutation_builder(api::timestamp_type ts, utils::UUID request_id);
+
+    upload_work_mutation_builder& set_work(const upload_work_row&);
+    upload_work_mutation_builder& del_work(uint64_t tablet_id, locator::host_id);
+
+    bool empty() const { return _m.partition().empty(); }
+    mutation build() { return std::move(_m); }
+};
+
+class upload_tablet_state_mutation_builder {
+    api::timestamp_type _ts;
+    schema_ptr _s;
+    mutation _m;
+private:
+    clustering_key get_ck(uint64_t tablet_id) const;
+public:
+    upload_tablet_state_mutation_builder(api::timestamp_type ts, utils::UUID request_id);
+
+    upload_tablet_state_mutation_builder& set_primary_host(uint64_t tablet_id, locator::host_id);
+    upload_tablet_state_mutation_builder& set_phase(uint64_t tablet_id, db::system_keyspace::upload_phase);
+
+    bool empty() const { return _m.partition().empty(); }
+    mutation build() { return std::move(_m); }
+};
+
+/// Request-scoped, so one tombstone each - the reason per-tablet state is not on system.tablets.
+mutation make_upload_work_clear_mutation(api::timestamp_type ts, utils::UUID request_id);
+mutation make_upload_tablet_state_clear_mutation(api::timestamp_type ts, utils::UUID request_id);
 
 extern template class topology_mutation_builder_base<topology_mutation_builder>;
 extern template class topology_mutation_builder_base<topology_node_mutation_builder>;

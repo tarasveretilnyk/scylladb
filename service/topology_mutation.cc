@@ -10,6 +10,7 @@
 #include "db/system_keyspace.hh"
 #include "topology_mutation.hh"
 #include "types/tuple.hh"
+#include "types/list.hh"
 #include "types/types.hh"
 #include "types/set.hh"
 #include "types/map.hh"
@@ -436,6 +437,88 @@ topology_request_tracking_mutation_builder& topology_request_tracking_mutation_b
     return *this;
 }
 
+topology_request_tracking_mutation_builder& topology_request_tracking_mutation_builder::set_upload_tablets_data(
+        const table_id& tid, bool primary_replica_only) {
+    apply_atomic("upload_table_id", tid.uuid());
+    apply_atomic("upload_primary_replica_only", primary_replica_only);
+    return *this;
+}
+
+
+upload_work_mutation_builder::upload_work_mutation_builder(api::timestamp_type ts, utils::UUID request_id)
+    : _ts(ts)
+    , _s(db::system_keyspace::upload_work())
+    , _m(_s, partition_key::from_single_value(*_s, data_value(request_id).serialize_nonnull()))
+{ }
+
+clustering_key upload_work_mutation_builder::get_ck(uint64_t tablet_id, locator::host_id host) const {
+    return clustering_key::from_exploded(*_s, {
+        data_value(int64_t(tablet_id)).serialize_nonnull(),
+        data_value(host.uuid()).serialize_nonnull(),
+    });
+}
+
+upload_work_mutation_builder& upload_work_mutation_builder::set_work(const upload_work_row& row) {
+    auto ck = get_ck(row.tablet_id, row.host);
+    _m.set_clustered_cell(ck, "estimated_bytes", data_value(int64_t(row.estimated_bytes)), _ts);
+    auto shard_list_type = list_type_impl::get_instance(int32_type, false);
+    std::vector<data_value> shard_values;
+    shard_values.reserve(row.shards.size());
+    for (auto s : row.shards) {
+        shard_values.emplace_back(int32_t(s));
+    }
+    _m.set_clustered_cell(ck, "shards", make_list_value(shard_list_type, std::move(shard_values)), _ts);
+    auto byte_list_type = list_type_impl::get_instance(long_type, false);
+    std::vector<data_value> byte_values;
+    byte_values.reserve(row.shard_bytes.size());
+    for (auto b : row.shard_bytes) {
+        byte_values.emplace_back(int64_t(b));
+    }
+    _m.set_clustered_cell(ck, "shard_bytes", make_list_value(byte_list_type, std::move(byte_values)), _ts);
+    return *this;
+}
+
+upload_work_mutation_builder& upload_work_mutation_builder::del_work(uint64_t tablet_id, locator::host_id host) {
+    _m.partition().apply_delete(*_s, get_ck(tablet_id, host), tombstone(_ts, gc_clock::now()));
+    return *this;
+}
+
+upload_tablet_state_mutation_builder::upload_tablet_state_mutation_builder(api::timestamp_type ts, utils::UUID request_id)
+    : _ts(ts)
+    , _s(db::system_keyspace::upload_tablet_state())
+    , _m(_s, partition_key::from_single_value(*_s, data_value(request_id).serialize_nonnull()))
+{ }
+
+clustering_key upload_tablet_state_mutation_builder::get_ck(uint64_t tablet_id) const {
+    return clustering_key::from_single_value(*_s, data_value(int64_t(tablet_id)).serialize_nonnull());
+}
+
+upload_tablet_state_mutation_builder& upload_tablet_state_mutation_builder::set_primary_host(
+        uint64_t tablet_id, locator::host_id host) {
+    _m.set_clustered_cell(get_ck(tablet_id), "primary_host", data_value(host.uuid()), _ts);
+    return *this;
+}
+
+upload_tablet_state_mutation_builder& upload_tablet_state_mutation_builder::set_phase(
+        uint64_t tablet_id, db::system_keyspace::upload_phase phase) {
+    _m.set_clustered_cell(get_ck(tablet_id), "phase",
+            data_value(db::system_keyspace::upload_phase_to_string(phase)), _ts);
+    return *this;
+}
+
+mutation make_upload_tablet_state_clear_mutation(api::timestamp_type ts, utils::UUID request_id) {
+    auto s = db::system_keyspace::upload_tablet_state();
+    mutation m(s, partition_key::from_single_value(*s, data_value(request_id).serialize_nonnull()));
+    m.partition().apply(tombstone(ts, gc_clock::now()));
+    return m;
+}
+
+mutation make_upload_work_clear_mutation(api::timestamp_type ts, utils::UUID request_id) {
+    auto s = db::system_keyspace::upload_work();
+    mutation m(s, partition_key::from_single_value(*s, data_value(request_id).serialize_nonnull()));
+    m.partition().apply(tombstone(ts, gc_clock::now()));
+    return m;
+}
 
 template class topology_mutation_builder_base<topology_mutation_builder>;
 template class topology_mutation_builder_base<topology_node_mutation_builder>;
