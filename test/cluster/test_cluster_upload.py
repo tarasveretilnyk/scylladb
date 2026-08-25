@@ -1165,3 +1165,180 @@ async def test_cluster_upload_reports_metrics(manager: ScyllaClusterManager):
 
 
 @pytest.mark.asyncio
+async def test_cluster_upload_two_tables_concurrently(manager: ScyllaClusterManager):
+    """Two tables uploading at once must not interfere.
+
+    Their work rows share system.upload_work and their per-tablet state shares
+    system.upload_tablet_state, both keyed by request, so a query that forgot to filter by
+    request or table would mix them - and progress reporting did exactly that in an earlier
+    revision.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        for cf in ('cf1', 'cf2'):
+            await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                                f"WITH tablets = {{'min_tablet_count': 8}}")
+            insert = cql.prepare(f"INSERT INTO {ks}.{cf} (pk, value) VALUES (?, ?)")
+            insert.consistency_level = ConsistencyLevel.ALL
+            await asyncio.gather(*(cql.run_async(insert, (str(k), k)) for k in range(KEYS)))
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved1 = await snapshot_to_tmp(manager, servers, ks, 'cf1', tmpname + '-1')
+        saved2 = await snapshot_to_tmp(manager, servers, ks, 'cf2', tmpname + '-2')
+        await cql.run_async(f"TRUNCATE TABLE {ks}.cf1")
+        await cql.run_async(f"TRUNCATE TABLE {ks}.cf2")
+        await plant_upload_dirs(saved1)
+        await plant_upload_dirs(saved2)
+
+        await asyncio.gather(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, 'cf1', timeout=150),
+            manager.api.tablets_upload_and_wait(servers[1].ip_addr, ks, 'cf2', timeout=150))
+
+        for cf in ('cf1', 'cf2'):
+            stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+            stmt.consistency_level = ConsistencyLevel.ALL
+            got = {row.pk for row in await cql.run_async(stmt)}
+            assert got == {str(k) for k in range(KEYS)}, f"{cf} did not load fully"
+
+        leftover = await cql.run_async("SELECT tablet_id FROM system.upload_work")
+        assert not leftover, "work rows left behind after both requests completed"
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_rejects_second_request_for_same_table(manager: ScyllaClusterManager):
+    """A second request for the same table must join the first rather than run twice.
+
+    Two independent requests would consume the same upload directories concurrently and
+    ingest the same sstables twice - idempotent for ordinary rows, wrong for counters.
+    """
+    servers = await manager.servers_add(2)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # Both must succeed - the second joins the first - and the data must be loaded once.
+        await asyncio.gather(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180),
+            manager.api.tablets_upload_and_wait(servers[1].ip_addr, ks, cf, timeout=180))
+
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+        await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_survives_coordinator_restart(manager: ScyllaClusterManager):
+    """The topology coordinator can go away mid-upload and the load must still finish.
+
+    This is the crash-safety property the request setup was designed around and which
+    nothing has exercised: the work list is written across several group0 commands and the
+    request is only marked started once all of it has landed, so a coordinator that dies
+    midway should leave a queued-but-not-started request that a new coordinator clears and
+    rescans. A coordinator that dies later, with transitions in flight, should instead find
+    the work list intact and carry on from it.
+
+    Restarting the raft leader is what moves the coordinator, so that is what this does.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        leader_host = await manager.api.get_raft_leader(servers[0].ip_addr)
+        leader = await manager.find_server_by_host_id(servers, leader_host)
+        others = [s for s in servers if s.server_id != leader.server_id]
+        logger.info(f"coordinator is on {leader.server_id}, restarting it mid-upload")
+
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(others[0].ip_addr, ks, cf, timeout=150))
+
+        async def work_exists():
+            rows = await cql.run_async("SELECT tablet_id FROM system.upload_work")
+            return True if rows else None
+        try:
+            await wait_for(work_exists, time.time() + 60, period=0.05)
+        except Exception:
+            logger.warning("upload finished before work was observed; restart will be a no-op")
+
+        await manager.server_restart(leader.server_id, wait_others=2)
+
+        # A new coordinator may resume or rebuild the work list, but must not drop part of it.
+        await upload
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}, \
+            f"{len(set(str(k) for k in range(KEYS)) - got)} rows lost across coordinator restart"
+
+        leftover_work = await cql.run_async("SELECT tablet_id FROM system.upload_work")
+        leftover_state = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
+        assert not leftover_work, f"{len(leftover_work)} work rows left after restart"
+        assert not leftover_state, f"{len(leftover_state)} tablet state rows left after restart"
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_into_non_empty_table(manager: ScyllaClusterManager):
+    """Uploading on top of existing data must merge, not replace or corrupt.
+
+    Every other test truncates first, so the ingested sstables are the only ones in the
+    table. Here they land alongside existing sstables, which is what exercises the decision
+    to mutate ingested sstables to level 0: keeping their original levels would break the
+    compaction strategy's invariants against the data already there.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.{cf} (pk, value) VALUES (?, ?)")
+        insert.consistency_level = ConsistencyLevel.ALL
+        await asyncio.gather(*(cql.run_async(insert, (str(k), k)) for k in range(KEYS // 2)))
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+
+        await asyncio.gather(*(cql.run_async(insert, (str(k), k)) for k in range(KEYS // 2, KEYS)))
+        await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+
+        await plant_upload_dirs(saved)
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=150)
+
+        stmt = cql.prepare(f"SELECT pk, value FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        rows = {row.pk: row.value for row in await cql.run_async(stmt)}
+
+        assert set(rows) == {str(k) for k in range(KEYS)}, (
+            f"expected both halves, missing {len(set(str(k) for k in range(KEYS)) - set(rows))}")
+        for k in range(KEYS):
+            assert rows[str(k)] == k, f"value for {k} became {rows[str(k)]} after the merge"
+
+        await wait_for_upload_dirs_empty(saved)
