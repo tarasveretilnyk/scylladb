@@ -102,6 +102,18 @@ async def wait_for_upload_dirs_empty(saved, timeout=60):
     await wait_for(check, time.time() + timeout, period=0.5)
 
 
+async def upload_dir_files(saved):
+    """Sstable files still sitting in every node's upload directory, by directory."""
+    present = {}
+    for cf_dir, _ in saved.values():
+        upload = os.path.join(cf_dir, 'upload')
+        if os.path.isdir(upload):
+            files = [f for f in os.listdir(upload) if not f.startswith('.')]
+            if files:
+                present[upload] = files
+    return present
+
+
 async def table_id_of(cql, ks, cf):
     """CQL has no subqueries, so the table id has to be looked up separately."""
     rows = await cql.run_async(f"SELECT id FROM system_schema.tables WHERE "
@@ -529,9 +541,6 @@ async def test_cluster_upload_pre_sizes_table(manager: ScyllaClusterManager):
 
 
 @pytest.mark.asyncio
-
-
-@pytest.mark.asyncio
 async def test_cluster_upload_pre_size_fails_fast_with_balancing_disabled(manager: ScyllaClusterManager):
     """--tablets must fail, not hang, when the balancer will never reach the count.
 
@@ -560,3 +569,186 @@ async def test_cluster_upload_pre_size_fails_fast_with_balancing_disabled(manage
         opts = dict(rows[0].tablets or {})
         assert 'max_tablet_count' not in opts, f"the failed pre-size left its pin in place: {opts}"
         assert opts.get('min_tablet_count') == '4', f"the original hint was not put back: {opts}"
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_work_drains_across_tablets(manager: ScyllaClusterManager):
+    """Several tablets must be uploading at once, not one after another.
+
+    This is the property the ticket is about: the old loader worked one tablet at a time,
+    so the cluster sat idle and early tablets filled while later ones stayed empty.
+
+    Sampling for it while the load runs does not work - on a dev-mode cluster with a small
+    dataset the whole upload finishes inside one sampling interval, so an earlier version
+    of this test passed or failed on timing luck. Instead every transition is pinned at an
+    error injection; while they are held, system.tablets can be read without racing
+    anything.
+
+    The injection has to sit in the upload path itself rather than in the mutation
+    streaming path: an upload moves a fully contained sstable by direct attach or by file
+    stream, and only a boundary-straddling one goes through mutations. Pinning the mutation
+    path alone left this test measuring whichever tablets happened to need it.
+    """
+    servers = await manager.servers_add(3)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        injection = "upload_tablet_before_transport"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
+
+        tid = await table_id_of(cql, ks, cf)
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=120))
+
+        # Release the held batches in the background; without this the injection stalls it forever.
+        async def release():
+            while True:
+                for s in servers:
+                    try:
+                        await manager.api.message_injection(s.ip_addr, injection)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.05)
+
+        peak = 0
+
+        async def watch():
+            nonlocal peak
+            while True:
+                try:
+                    rows = await cql.run_async(
+                        f"SELECT stage FROM system.tablets WHERE table_id = {tid}")
+                    peak = max(peak, sum(1 for r in rows if r.stage == 'upload'))
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)
+
+        watcher = asyncio.create_task(watch())
+
+        # If more than one transition is held at once the load is not serialised - the whole point.
+        async def more_than_one_held():
+            return True if peak > 1 else None
+        try:
+            await wait_for(more_than_one_held, time.time() + 30, period=0.1)
+        except Exception:
+            logger.warning("never saw more than one held transition; the assertion below will say so")
+
+        releaser = asyncio.create_task(release())
+
+        try:
+            await upload
+        finally:
+            watcher.cancel()
+            releaser.cancel()
+            for s in servers:
+                try:
+                    await manager.api.disable_injection(s.ip_addr, injection)
+                except Exception:
+                    pass
+
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+
+        logger.info(f"peak concurrent upload transitions: {peak}")
+        assert peak > 1, (f"only {peak} tablet(s) were ever uploading at once; the load is "
+                          f"still serialised one tablet at a time")
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_abort(manager: ScyllaClusterManager):
+    """An upload must be cancellable, and cancelling must not lose the unconsumed data.
+
+    Three things have to hold, and this test used to check none of them: the request has to
+    report the abort as its outcome rather than success, the sstables it did not consume have
+    to still be in the upload directories, and a later upload of the same table has to
+    actually re-ingest them instead of joining the aborted request and inheriting its result.
+
+    Every transition is parked before it picks a transport, so the abort lands while the
+    request is live and provably before anything has been consumed. Without that the upload
+    can finish before the abort arrives, which is what made the old version of this test
+    accept either outcome - and therefore assert nothing.
+    """
+    servers = await manager.servers_add(3)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+        planted = await upload_dir_files(saved)
+        assert planted, "nothing was planted, so the rest of this test would prove nothing"
+
+        injection = "upload_tablet_before_transport"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
+
+        tid = await table_id_of(cql, ks, cf)
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180))
+
+        async def transitions_parked():
+            rows = await cql.run_async(f"SELECT stage FROM system.tablets WHERE table_id = {tid}")
+            return True if sum(1 for r in rows if r.stage == 'upload') > 0 else None
+
+        releaser = None
+        try:
+            await wait_for(transitions_parked, time.time() + 60, period=0.1)
+            await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
+
+            async def release():
+                while True:
+                    for s in servers:
+                        try:
+                            await manager.api.message_injection(s.ip_addr, injection)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.05)
+
+            releaser = asyncio.create_task(release())
+
+            # The abort is the outcome: success would let teardown delete sstables never loaded.
+            with pytest.raises(Exception):
+                await upload
+        finally:
+            if releaser:
+                releaser.cancel()
+            for s in servers:
+                await manager.api.disable_injection(s.ip_addr, injection)
+
+        async def work_gone():
+            rows = await cql.run_async("SELECT tablet_id FROM system.upload_work")
+            return True if not rows else None
+        await wait_for(work_gone, time.time() + 60, period=0.5)
+
+        left = await upload_dir_files(saved)
+        assert set(left) == set(planted), (
+            f"abort lost unconsumed sstables: planted {planted}, left {left}")
+        assert await cql.run_async(f"SELECT count(*) FROM {ks}.{cf}") == [(0,)], \
+            "rows were ingested by a request that was aborted before any transport ran"
+
+        # A second upload must re-scan, not join the aborted request and inherit its outcome.
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180)
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+        await wait_for_upload_dirs_empty(saved)
+
+
