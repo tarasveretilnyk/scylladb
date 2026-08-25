@@ -156,7 +156,18 @@ protected:
     const primary_replica_only _primary_replica_only;
     const unlink_sstables _unlink_sstables;
     const stream_scope _stream_scope;
+    // When set, every partition goes to exactly this host - the primary the scheduler assigned.
+    std::optional<locator::host_id> _explicit_target;
+    seastar::abort_source* _abort_source = nullptr;
 public:
+    void set_explicit_target(locator::host_id host) {
+        _explicit_target = host;
+    }
+
+    void set_abort_source(seastar::abort_source& as) {
+        _abort_source = &as;
+    }
+
     sstable_streamer(netw::messaging_service& ms, replica::database& db, ::table_id table_id, locator::effective_replication_map_ptr erm,
                      std::vector<sstables::shared_sstable> sstables, primary_replica_only primary, unlink_sstables unlink, stream_scope scope)
             : _ms(ms)
@@ -204,6 +215,11 @@ public:
 
     virtual future<> stream(shared_ptr<stream_progress> on_streamed) override;
     virtual host_id_vector_replica_set get_primary_endpoints(const dht::token& token, std::function<bool(const locator::host_id&)> filter) const override;
+
+    future<> stream_one_tablet(const dht::token_range& tablet_range,
+                               std::vector<sstables::shared_sstable> fully_contained,
+                               std::vector<sstables::shared_sstable> partially_contained,
+                               shared_ptr<stream_progress> progress);
 
 private:
     host_id_vector_replica_set to_replica_set(const locator::tablet_replica_set& replicas) const {
@@ -289,6 +305,9 @@ private:
 };
 
 host_id_vector_replica_set sstable_streamer::get_endpoints(const dht::token& token) const {
+    if (_explicit_target) {
+        return host_id_vector_replica_set{*_explicit_target};
+    }
     auto host_filter = [&topo = _erm->get_topology(), scope = _stream_scope] (const locator::host_id& ep) {
         switch (scope) {
         case stream_scope::all:
@@ -453,21 +472,29 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
                    }) | std::ranges::to<std::vector>());
 
     for (auto& [tablet_range, sstables_fully_contained, sstables_partially_contained] : classified_sstables) {
-        auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
-            progress,
-            sstables_fully_contained.size() + sstables_partially_contained.size());
-        auto tablet_pr = dht::to_partition_range(tablet_range);
-        if (!sstables_partially_contained.empty()) {
-            llog.debug("Streaming {} partially contained SSTables.",sstables_partially_contained.size());
-            co_await stream_sstables(tablet_pr, std::move(sstables_partially_contained), per_tablet_progress, defer_unlinking::yes);
-        }
-        if (!sstables_fully_contained.empty()) {
-            llog.debug("Streaming {} fully contained SSTables.",sstables_fully_contained.size());
-            co_await stream_fully_contained_sstables(tablet_pr, std::move(sstables_fully_contained), per_tablet_progress);
-        }
+        co_await stream_one_tablet(tablet_range, std::move(sstables_fully_contained),
+                std::move(sstables_partially_contained), progress);
     }
 
     co_await unlink_marked_sstables();
+}
+
+future<> tablet_sstable_streamer::stream_one_tablet(const dht::token_range& tablet_range,
+        std::vector<sstables::shared_sstable> fully_contained,
+        std::vector<sstables::shared_sstable> partially_contained,
+        shared_ptr<stream_progress> progress) {
+    auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
+        progress,
+        fully_contained.size() + partially_contained.size());
+    auto tablet_pr = dht::to_partition_range(tablet_range);
+    if (!partially_contained.empty()) {
+        llog.debug("Streaming {} partially contained SSTables.", partially_contained.size());
+        co_await stream_sstables(tablet_pr, std::move(partially_contained), per_tablet_progress, defer_unlinking::yes);
+    }
+    if (!fully_contained.empty()) {
+        llog.debug("Streaming {} fully contained SSTables.", fully_contained.size());
+        co_await stream_fully_contained_sstables(tablet_pr, std::move(fully_contained), per_tablet_progress);
+    }
 }
 
 future<> sstable_streamer::stream_sstables(const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables, shared_ptr<stream_progress> progress, defer_unlinking defer) {
@@ -522,6 +549,9 @@ future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid,
 
     try {
         while (auto mf = co_await reader()) {
+            if (_abort_source) {
+                _abort_source->check();
+            }
             bool is_partition_start = mf->is_partition_start();
             if (is_partition_start) {
                 ++num_partitions_processed;
