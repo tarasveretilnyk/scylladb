@@ -1733,6 +1733,21 @@ db::config::config(std::shared_ptr<db::extensions> exts)
          "Maximum number of tablets which may be leaving a shard at the same time. Effecting only on topology coordinator. Set to the same value on all nodes.")
     , tablet_streaming_write_concurrency_per_shard(this, "tablet_streaming_write_concurrency_per_shard", liveness::LiveUpdate, value_status::Used, 2,
          "Maximum number of tablets which may be pending on a shard at the same time. Effecting only on topology coordinator. Set to the same value on all nodes.")
+    , tablet_upload_batch_size_in_mb(this, "tablet_upload_batch_size_in_mb", liveness::LiveUpdate, value_status::Used, 1024,
+         "How much cluster upload work, in MiB, a shard is filled up to before the scheduler stops giving "
+         "it more. Upload work is sliced per (source node, shard, tablet), so a shard often has many small "
+         "slices to move and each one costs a group0 round trip to start, a barrier, and another to retire; "
+         "batching enough bytes together amortises that. This is a floor to reach rather than a cap, so the "
+         "slice which crosses it overshoots - use tablet_upload_concurrency_per_shard to bound how much a "
+         "shard runs at once. Effecting only on topology coordinator.")
+    , tablet_upload_concurrency_per_shard(this, "tablet_upload_concurrency_per_shard", liveness::LiveUpdate, value_status::Used, 8,
+         "Hard ceiling on concurrent cluster upload transitions per shard, regardless of their size. "
+         "Bounds the number of streaming sessions and reader permits a shard can be asked to hold at once. "
+         "tablet_upload_batch_size_in_mb is what normally paces a load; this is the backstop for work whose "
+         "size is unknown, and for keeping the number of open streams on a shard sane. One unit of work covers "
+         "a whole source node's slice of a tablet across all of its shards, so transitions are few and large - "
+         "a high ceiling here buys little and costs file handles and reader permits. "
+         "Effecting only on topology coordinator.")
     , service_levels_interval(this, "service_levels_interval_ms", liveness::LiveUpdate, value_status::Used, 10000, "Controls how often service levels module polls configuration table")
 
     , audit(this, "audit", value_status::Used, "table",
