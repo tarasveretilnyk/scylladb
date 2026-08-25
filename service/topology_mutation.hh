@@ -136,7 +136,7 @@ public:
     topology_mutation_builder& start_rf_change_migrations(const utils::UUID&);
     topology_mutation_builder& finish_rf_change_migrations(const std::unordered_set<utils::UUID>&, const utils::UUID&);
     topology_mutation_builder& start_restore_request(const utils::UUID& req_id);
-    topology_mutation_builder& finish_restore_request(const std::unordered_set<utils::UUID>& current, const utils::UUID& req_id);
+    topology_mutation_builder& finish_restore_requests(const std::unordered_set<utils::UUID>& current, const std::unordered_set<utils::UUID>& finished);
     topology_mutation_builder& start_upload_request(const utils::UUID& req_id);
     topology_mutation_builder& finish_upload_requests(const std::unordered_set<utils::UUID>& current, const std::unordered_set<utils::UUID>& finished);
     topology_node_mutation_builder& with_node(raft::server_id);

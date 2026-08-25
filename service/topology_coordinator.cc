@@ -1254,6 +1254,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         case global_topology_request::quiesce: {
             std::optional<sstring> error;
             group0_update_collector updates;
+            std::vector<upload_completion_info> finishes;
             bool requires_schema_changes = false;
 
             try {
@@ -1268,7 +1269,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     auto plan = co_await _tablet_allocator.balance_tablets(tm, &_topo_sm._topology, &_sys_ks, {}, {});
                     if (!plan.empty()) {
                         error = "tablet balance plan is not empty";
-                        co_await generate_tablet_transition_updates(updates, guard, plan);
+                        co_await generate_tablet_transition_updates(updates, guard, plan, finishes);
                         requires_schema_changes = plan.requires_schema_changes();
                     } else if (!tm->tablets().is_idle()) {
                         error = "tablet resize in progress";
@@ -1282,6 +1283,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             } catch (...) {
                 error = fmt::format("quiesce request failed: {}", std::current_exception());
                 updates.clear();
+                finishes.clear();
             }
 
             updates.emplace_back(
@@ -1303,6 +1305,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             } else {
                 co_await update_topology_state(std::move(guard), std::move(updates), "quiesce request completed");
             }
+            co_await drain_upload_finishes(std::move(finishes));
         }
         break;
         case global_topology_request::snapshot_tables: {
@@ -2200,7 +2203,10 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         }
     }
 
-    future<> generate_migration_updates(group0_update_collector& out, const group0_guard& guard, const migration_plan& plan) {
+    // finishes travels alongside `out` because the two share a fate: the teardown RPCs may only
+    // be sent once these mutations commit, and must be dropped with them if they are not.
+    future<> generate_migration_updates(group0_update_collector& out, const group0_guard& guard,
+            const migration_plan& plan, std::vector<upload_completion_info>& finishes) {
         tablet_builder_map migration_builders;
 
         if (plan.resize_plan().finalize_resize.empty() || plan.has_nodes_to_drain()) {
@@ -2273,15 +2279,47 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             generate_resize_update(out, guard, table_id, resize_decision);
         }
 
-        for (const auto& completion : plan.restore_completions()) {
-            rtlogger.info("All restore transitions for table {} completed, finishing request {}", completion.table, completion.request_id);
-            out.emplace_back(
-                topology_mutation_builder(guard.write_timestamp())
-                    .finish_restore_request(_topo_sm._topology.ongoing_restore_requests, completion.request_id)
-                    .build());
+        // ongoing_upload_requests is a single collection cell, so removing an id rewrites the
+        // whole set. Two such overwrites at the same write timestamp resurrect each other's
+        // dropped id, so emit one overwrite for every id finished this pass. Same for restore.
+        std::unordered_set<utils::UUID> finished_upload_requests;
+        for (const auto& completion : plan.upload_completions()) {
+            rtlogger.info("All upload work for table {} consumed, finishing request {}", completion.table, completion.request_id);
+
+            // Every node must drop the opened upload directory and, on success, remove the
+            // sstables it consumed - the first point at which no remaining work can reference
+            // them. Queued, not sent: sending holds the group0 guard across a cluster round trip.
+            finishes.push_back(completion);
+            finished_upload_requests.insert(completion.request_id);
+            out.emplace_back(canonical_mutation(
+                make_upload_work_clear_mutation(guard.write_timestamp(), completion.request_id)));
+            out.emplace_back(canonical_mutation(
+                make_upload_tablet_state_clear_mutation(guard.write_timestamp(), completion.request_id)));
             out.emplace_back(
                 topology_request_tracking_mutation_builder(completion.request_id)
                     .done(completion.error.empty() ? std::nullopt : std::optional<sstring>(completion.error))
+                    .build());
+        }
+        if (!finished_upload_requests.empty()) {
+            out.emplace_back(
+                topology_mutation_builder(guard.write_timestamp())
+                    .finish_upload_requests(_topo_sm._topology.ongoing_upload_requests, finished_upload_requests)
+                    .build());
+        }
+
+        std::unordered_set<utils::UUID> finished_restore_requests;
+        for (const auto& completion : plan.restore_completions()) {
+            rtlogger.info("All restore transitions for table {} completed, finishing request {}", completion.table, completion.request_id);
+            finished_restore_requests.insert(completion.request_id);
+            out.emplace_back(
+                topology_request_tracking_mutation_builder(completion.request_id)
+                    .done(completion.error.empty() ? std::nullopt : std::optional<sstring>(completion.error))
+                    .build());
+        }
+        if (!finished_restore_requests.empty()) {
+            out.emplace_back(
+                topology_mutation_builder(guard.write_timestamp())
+                    .finish_restore_requests(_topo_sm._topology.ongoing_restore_requests, finished_restore_requests)
                     .build());
         }
     }
@@ -2387,6 +2425,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
         rtlogger.debug("handle_tablet_migration()");
         group0_update_collector updates;
+        std::vector<upload_completion_info> finishes;
         bool needs_barrier = false;
         bool has_transitions = false;
         tablet_builder_map tablet_builders;
@@ -3157,7 +3196,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             requires_schema_changes = plan.requires_schema_changes();
             retry_at = plan.retry_at();
             if (!drain || plan.has_nodes_to_drain()) {
-                co_await generate_migration_updates(updates, guard, plan);
+                co_await generate_migration_updates(updates, guard, plan, finishes);
             }
         }
 
@@ -3176,6 +3215,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             } else {
                 co_await update_topology_state(std::move(guard), std::move(updates), format("Tablet migration"));
             }
+            co_await drain_upload_finishes(std::move(finishes));
         }
 
         if (needs_barrier) {
@@ -5007,14 +5047,16 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
     // Returns true if migration updates were generated.
     // Appends migration mutations + tablet_migration transition state to `updates`.
     future<bool> generate_tablet_migration_state_updates(
-            group0_update_collector& updates, const group0_guard& guard, migration_plan& plan);
+            group0_update_collector& updates, const group0_guard& guard, migration_plan& plan,
+            std::vector<upload_completion_info>& finishes);
 
     // Generates tablet migration or resize finalization mutations from a non-empty plan.
     // Appends to `updates`. Does not commit. Caller is responsible for committing.
     // Returns true if updates were generated, false if nothing was produced (injection postponed).
     // Precondition: !plan.empty().
     future<bool> generate_tablet_transition_updates(
-            group0_update_collector& updates, const group0_guard& guard, migration_plan& plan);
+            group0_update_collector& updates, const group0_guard& guard, migration_plan& plan,
+            std::vector<upload_completion_info>& finishes);
 
     // Generates a single resize finalization mutation (set tstate + version bump).
     // Appends to `updates`. Does not commit.
@@ -5180,7 +5222,8 @@ future<std::optional<group0_guard>> topology_coordinator::maybe_start_tablet_mig
     }
 
     group0_update_collector updates;
-    if (!co_await generate_tablet_transition_updates(updates, guard, plan)) {
+    std::vector<upload_completion_info> finishes;
+    if (!co_await generate_tablet_transition_updates(updates, guard, plan, finishes)) {
         co_return std::move(guard);
     }
 
@@ -5189,13 +5232,16 @@ future<std::optional<group0_guard>> topology_coordinator::maybe_start_tablet_mig
     } else {
         co_await update_topology_state(std::move(guard), std::move(updates), "Starting tablet migration");
     }
+    // This path completes requests too; leaving them to whichever pass ran next dropped them.
+    co_await drain_upload_finishes(std::move(finishes));
     co_return std::nullopt;
 }
 
 future<bool> topology_coordinator::generate_tablet_migration_state_updates(
-        group0_update_collector& updates, const group0_guard& guard, migration_plan& plan) {
+        group0_update_collector& updates, const group0_guard& guard, migration_plan& plan,
+        std::vector<upload_completion_info>& finishes) {
     auto initial_change_counter = updates.change_counter();
-    co_await generate_migration_updates(updates, guard, plan);
+    co_await generate_migration_updates(updates, guard, plan, finishes);
 
     if (updates.change_counter() != initial_change_counter) {
         updates.emplace_back(
@@ -5209,8 +5255,9 @@ future<bool> topology_coordinator::generate_tablet_migration_state_updates(
 }
 
 future<bool> topology_coordinator::generate_tablet_transition_updates(
-        group0_update_collector& updates, const group0_guard& guard, migration_plan& plan) {
-    if (co_await generate_tablet_migration_state_updates(updates, guard, plan)) {
+        group0_update_collector& updates, const group0_guard& guard, migration_plan& plan,
+        std::vector<upload_completion_info>& finishes) {
+    if (co_await generate_tablet_migration_state_updates(updates, guard, plan, finishes)) {
         co_return true;
     }
 

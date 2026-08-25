@@ -300,9 +300,11 @@ topology_mutation_builder& topology_mutation_builder::start_restore_request(cons
     return apply_set("ongoing_restore_requests", collection_apply_mode::update, std::vector<data_value>{req_id});
 }
 
-topology_mutation_builder& topology_mutation_builder::finish_restore_request(const std::unordered_set<utils::UUID>& current, const utils::UUID& req_id) {
+topology_mutation_builder& topology_mutation_builder::finish_restore_requests(const std::unordered_set<utils::UUID>& current, const std::unordered_set<utils::UUID>& finished) {
     auto new_values = current;
-    new_values.erase(req_id);
+    for (const auto& req_id : finished) {
+        new_values.erase(req_id);
+    }
     return apply_set("ongoing_restore_requests", collection_apply_mode::overwrite, new_values | std::views::transform([] (const auto& id) { return data_value{id}; }));
 }
 
