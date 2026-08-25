@@ -618,7 +618,6 @@ void cluster_cleanup_operation(scylla_rest_client& client, const bpo::variables_
     client.post("/storage_service/cleanup_all/", std::move(params));
 }
 
-
 // Report a long-running cluster task the way nodetool refresh does. Shared by upload and backup.
 void wait_for_cluster_task(scylla_rest_client& client, const bpo::variables_map& vm, std::string_view task_id) {
     if (vm.contains("nowait")) {
@@ -648,6 +647,37 @@ end: {}
     if (exit_code != EXIT_SUCCESS) {
         throw operation_failed_with_status{exit_code};
     }
+}
+
+void cluster_upload_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    auto res = parse_keyspace_and_tables(client, vm, true);
+    if (!keyspace_uses_tablets(client, res.keyspace)) {
+        throw std::invalid_argument("nodetool cluster upload loads only into tablet keyspaces. For vnode keyspaces use nodetool refresh on each node.");
+    }
+    if (res.tables.size() != 1) {
+        throw std::invalid_argument("nodetool cluster upload requires exactly one table");
+    }
+
+    std::unordered_map<sstring, sstring> params;
+    params["ks"] = res.keyspace;
+    params["table"] = res.tables.front();
+
+    if (vm.contains("abort")) {
+        // Sizing and replication options would suggest they apply to the abort, which they do not.
+        client.post("/storage_service/tablets/upload/abort", std::move(params));
+        return;
+    }
+
+    if (vm.contains("tablets")) {
+        params["tablet_count"] = fmt::to_string(vm["tablets"].as<int64_t>());
+    }
+    if (vm.contains("primary-replica-only")) {
+        params["primary_replica_only"] = "true";
+    }
+
+    const auto upload_res = client.post("/storage_service/tablets/upload", std::move(params));
+    const auto task_id = rjson::to_string_view(upload_res);
+    wait_for_cluster_task(client, vm, task_id);
 }
 
 void cluster_repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
@@ -4185,6 +4215,49 @@ For more information, see: {}
                         },
                     },
                     {
+                        "upload",
+                        "Load SSTables from every node's upload directory into a tablet table",
+fmt::format(R"(
+Consumes the upload directory of every node in the cluster in a single
+operation, so it only has to be run on one node - unlike nodetool refresh,
+which loads the upload directory of the node it runs on.
+
+The work is scheduled by the tablet load balancer, one tablet at a time, so
+tablets fill evenly and tablet migrations are not blocked for the duration of
+the load.
+
+Use --tablets to size the table before loading. Loading into a table with too
+few tablets produces very large tablets which then have to be split and
+rebalanced afterwards.
+
+The command waits for the load to finish. Pass --nowait to return as soon as it
+has started, and follow it with the 'task' subcommands.
+
+Use --abort to cancel an upload that is already running. Data already loaded
+stays loaded, and the sstables that were not consumed are left in the upload
+directories so the operation can be retried.
+
+While an upload is running, the tablet count of the table is held fixed: the
+work is tracked per tablet, so a split or merge would strand it. Tablet
+migrations continue as normal.
+
+Note that nodetool cluster upload loads only into tablet keyspaces. For vnode
+keyspaces use nodetool refresh on each node.
+
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/cluster/upload.html")),
+                        {
+                            typed_option<int64_t>("tablets", "Resize the table to this many tablets and wait for the balancer before loading"),
+                            typed_option<>("primary-replica-only", "Load into each tablet's primary replica only, skipping replication to the other replicas"),
+                            typed_option<>("abort", "Cancel an upload of this table that is already running"),
+                            typed_option<>("nowait", "Don't wait on the upload to finish; print its task id and return"),
+                        },
+                        {
+                            typed_option<sstring>("keyspace", "The keyspace to load into", 1),
+                            typed_option<std::vector<sstring>>("table", "The table to load into", 1),
+                        },
+                    },
+                    {
                         "backup",
                         "Backup a cluster-wide snapshot of specified keyspaces or specified table(s) to remote location",
 fmt::format(R"(
@@ -4216,6 +4289,9 @@ For more information, see: {}
                     },
                     {
                         "backup", { cluster_backup_operation }
+                    },
+                    {
+                        "upload", { cluster_upload_operation }
                     },
                 }
             }
