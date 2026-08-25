@@ -20,6 +20,7 @@
 #include <seastar/rpc/rpc.hh>
 #include <seastar/util/short_streams.hh> 
 #include "sstables_loader.hh"
+#include "db/tablet_options.hh"
 #include "db/config.hh"
 #include "dht/auto_refreshing_sharder.hh"
 #include "replica/distributed_loader.hh"
@@ -37,6 +38,7 @@
 #include "utils/error_injection.hh"
 #include "sstables_loader_helpers.hh"
 #include "db/system_distributed_keyspace.hh"
+#include "db/system_keyspace.hh"
 #include "cql3/query_processor.hh"
 #include "streaming/stream_blob.hh"
 #include "db/view/view_update_checks.hh"
@@ -49,6 +51,7 @@
 #include "utils/rjson.hh"
 #include "db/system_distributed_keyspace.hh"
 
+#include <bit>
 #include <cfloat>
 #include <algorithm>
 
@@ -735,6 +738,7 @@ future<> sstables_loader::load_new_sstables(sstring ks_name, sstring cf_name,
 
     llog.info("Loading new SSTables for keyspace={}, table={}, load_and_stream={}, primary_replica_only={}, skip_cleanup={}, skip_reshape={}, scope={}",
             ks_name, cf_name, load_and_stream_desc, primary, skip_cleanup, skip_reshape, scope);
+
     try {
         if (load_and_stream) {
             ::table_id table_id;
@@ -2438,6 +2442,211 @@ protected:
         _progress.completed = _progress.total;
     }
 };
+
+// Progress counts the rows of system.upload_work still to consume; nothing is added to a request
+// once live, so the count only falls.
+class sstables_loader::cluster_upload_task_impl : public sstables_loader::progress_reporting_task_impl {
+    sharded<sstables_loader>& _loader;
+    table_id _tid;
+    std::optional<size_t> _target_tablet_count;
+    bool _primary_replica_only;
+    std::optional<utils::UUID> _request_id;
+
+    future<> update_progress() override {
+        if (!_request_id) {
+            co_return;
+        }
+        auto& loader = _loader.local();
+        // Counted server-side and restricted to this request's partition: materializing the rows
+        // costs nodes x tablets decoded rows every tick, just to take their count.
+        uint64_t outstanding = 0;
+        co_await loader._sys_dist_ks.qp().query_internal(
+                format("SELECT COUNT(tablet_id) AS c FROM system.{} WHERE request_id = {}",
+                        db::system_keyspace::UPLOAD_WORK, *_request_id),
+                [&outstanding] (const cql3::untyped_result_set::row& row) -> future<stop_iteration> {
+                    outstanding = uint64_t(row.get_as<int64_t>("c"));
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                });
+        if (_progress_frozen) {
+            co_return;
+        }
+        // High-water mark, not first observation: the work list is written across many group0
+        // commands, so an early sample would peg progress at zero until the count fell below it.
+        _progress.total = std::max(_progress.total, double(outstanding));
+        _progress.completed = _progress.total - outstanding;
+    }
+
+public:
+    cluster_upload_task_impl(tasks::task_manager::module_ptr module, sharded<sstables_loader>& loader,
+            sstring ks, sstring table, table_id tid, std::optional<size_t> target_tablet_count,
+            bool primary_replica_only) noexcept
+        : progress_reporting_task_impl(module, tasks::task_id::create_random_id(), 0, "node", ks, table, "", tasks::task_id::create_null_id())
+        , _loader(loader)
+        , _tid(std::move(tid))
+        , _target_tablet_count(target_tablet_count)
+        , _primary_replica_only(primary_replica_only)
+    {
+        _status.progress_units = "work items";
+        init_progress_timer();
+    }
+
+    virtual std::string type() const override {
+        return "cluster_upload";
+    }
+
+    void abort() noexcept override {
+        tasks::task_manager::task::impl::abort();
+        (void)_loader.local()._ss.local().abort_upload_tablets(_tid).handle_exception([tid = _tid] (std::exception_ptr ex) {
+            llog.warn("Failed to abort cluster upload for table {}: {}", tid, ex);
+        });
+    }
+
+protected:
+    virtual future<> run() override {
+        auto& loader = _loader.local();
+        _progress_update_timer.arm(lowres_clock::now() + 1s);
+
+        // Pre-size before the request exists, so the coordinator's scan measures work against the
+        // boundaries the data will land in: uploading into an under-provisioned table produces
+        // exactly the oversized tablets this mechanism exists to avoid. min == max == target is the
+        // only form alter_table_with_tablet_hints() will wait on, and it has to be put back or the
+        // table can never split or merge again.
+        std::optional<ssize_t> saved_min_tablet_count;
+        std::optional<ssize_t> saved_max_tablet_count;
+        bool hints_pinned = false;
+        if (_target_tablet_count) {
+            // Only the invocation that starts the upload may pre-size. A second --tablets caller
+            // would pin the table under the first's load, and since make_resize_plan() skips a
+            // table with an ongoing upload its target could never be reached, so it would hang.
+            if (co_await loader._ss.local().has_upload_request_for(_tid)) {
+                throw std::invalid_argument(fmt::format("Table {} already has an upload in progress; "
+                        "--tablets can only be used by the invocation that starts it", _tid));
+            }
+            auto opts = loader.local_db().find_schema(_tid)->tablet_options();
+            saved_min_tablet_count = opts.min_tablet_count;
+            saved_max_tablet_count = opts.max_tablet_count;
+            llog.info("Pre-sizing table {} to {} tablets before upload", _tid, *_target_tablet_count);
+        }
+
+        std::exception_ptr eptr;
+        try {
+            if (_target_tablet_count) {
+                // Pinned before the wait, not after: the schema change lands first, and a wait
+                // that then fails or is aborted must still put the hints back below.
+                hints_pinned = true;
+                co_await loader._ss.local().alter_table_with_tablet_hints(_tid, *_target_tablet_count,
+                        *_target_tablet_count, true, false, &_as);
+            }
+            // abort() cancels the request by table, so an abort that lands before the request
+            // exists - during the pre-size above, or before upload_tablets() commits it - finds
+            // nothing to cancel. Checked here, and again once the request id is known, so that
+            // window ends in a failed task instead of a load that runs to completion.
+            co_await utils::get_local_injector().inject("cluster_upload_before_request",
+                    [this] (auto& handler) -> future<> {
+                        llog.info("cluster_upload_before_request: paused before registering the upload of {}", _tid);
+                        co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{10});
+                    });
+            _as.check();
+            co_await loader._ss.local().upload_tablets(_tid, _primary_replica_only, _target_tablet_count,
+                    [this] (utils::UUID request_id) -> future<> {
+                        _request_id = request_id;
+                        // abort() raises _as before it scans for the request, so finding it set
+                        // here means the scan may have run before the request was committed.
+                        // Repeated now that there is a request to record the abort on.
+                        if (_as.abort_requested()) {
+                            co_await _loader.local()._ss.local().abort_upload_tablets(_tid);
+                        }
+                    });
+        } catch (...) {
+            eptr = std::current_exception();
+            llog.error("Cluster upload failed for table_id {}: {}", _tid, eptr);
+        }
+
+        if (hints_pinned) {
+            try {
+                llog.info("Restoring tablet count hints of table {} after upload", _tid);
+                // remove_unset: otherwise a table that had no hint keeps this task's pin forever.
+                co_await loader._ss.local().alter_table_with_tablet_hints(_tid,
+                        saved_min_tablet_count, saved_max_tablet_count, false, true);
+            } catch (...) {
+                llog.error("Failed to restore tablet count hints of table {}: {}",
+                        _tid, std::current_exception());
+            }
+        }
+
+        _progress_update_timer.cancel();
+        if (eptr) {
+            std::rethrow_exception(eptr);
+        }
+        _progress_frozen = true;
+        _progress.completed = _progress.total;
+    }
+};
+
+future<tasks::task_id> sstables_loader::upload_tablets_task(table_id tid, sstring keyspace, sstring table,
+        std::optional<size_t> target_tablet_count, bool primary_replica_only) {
+    // Rejected before a task exists: pre-sizing waits for the balancer with a bare equality test,
+    // no timeout and no abort source (alter_table_with_tablet_hints()' own FIXME, SCYLLADB-1076),
+    // so a count the balancer will never produce hangs before the task's abort has anything to
+    // cancel.
+    if (target_tablet_count) {
+        auto opts = _db.local().find_schema(tid)->tablet_options();
+        if (opts.pow2_count.value_or(db::tablet_options::default_pow2_count)
+                && !std::has_single_bit(*target_tablet_count)) {
+            throw std::invalid_argument(fmt::format(
+                    "Cannot pre-size {}.{} to {} tablets: the table aligns tablet counts to powers "
+                    "of two, so the balancer would never reach that count. Pass a power of two "
+                    "({} or {}), or set pow2_count = false on the table.",
+                    keyspace, table, *target_tablet_count,
+                    std::bit_floor(*target_tablet_count), std::bit_ceil(*target_tablet_count)));
+        }
+    }
+    // Checked at the entry point too, but that is only reached after the pre-size; a
+    // mixed-version cluster is turned away before any schema change.
+    if (!_db.local().features().tablet_upload) {
+        throw std::invalid_argument("Cannot upload cluster-wide: every node must support TABLET_UPLOAD first");
+    }
+    // A co-located table has no system.tablets partition of its own to hold the upload
+    // transitions the coordinator writes, so a request for one can never run: the coordinator
+    // would fail the same plan every pass until the request is aborted. Rejected up front,
+    // synchronously, like the vnode case.
+    {
+        const auto& tablets = _ss.local().get_token_metadata().tablets();
+        if (tablets.has_tablet_map(tid) && !tablets.is_base_table(tid)) {
+            auto base = _db.local().find_schema(tablets.get_base_table(tid));
+            throw std::invalid_argument(fmt::format(
+                    "Cannot upload into {}.{}: it is co-located with {}.{}, and cluster upload supports "
+                    "base tables only; load it with nodetool refresh on each node instead",
+                    keyspace, table, base->ks_name(), base->cf_name()));
+        }
+    }
+    llog.info("Starting cluster upload for {}.{}, target_tablet_count={} primary_replica_only={}",
+            keyspace, table, target_tablet_count, primary_replica_only);
+    auto task = co_await _task_manager_module->make_and_start_task<cluster_upload_task_impl>({}, container(),
+            std::move(keyspace), std::move(table), tid, target_tablet_count, primary_replica_only);
+    co_return task->id();
+}
+
+future<> sstables_loader::abort_upload(table_id tid) {
+    // The tasks first: a task that has not registered its request yet (it is pre-sizing the
+    // table, or about to commit) is reachable only through its abort source, and its abort()
+    // repeats the request-level abort once the request exists. Then the request itself, for
+    // callers whose task lives on another node or has no task at all.
+    auto s = _db.local().find_schema(tid);
+    co_await container().invoke_on_all([ks = s->ks_name(), cf = s->cf_name()] (sstables_loader& loader) {
+        for (auto& [id, task] : loader._task_manager_module->get_local_tasks()) {
+            if (task->type() != "cluster_upload" || task->is_complete()) {
+                continue;
+            }
+            const auto& st = task->get_status();
+            if (st.keyspace == ks && st.table == cf) {
+                llog.info("Aborting cluster upload task {} of {}.{}", id, ks, cf);
+                task->abort();
+            }
+        }
+    });
+    co_await _ss.local().abort_upload_tablets(tid);
+}
 
 future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, sstring prefix, utils::chunked_vector<sstring> manifests) {
     auto summary = co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks, keyspace, table, endpoint, bucket, prefix, snap_name, std::move(manifests));

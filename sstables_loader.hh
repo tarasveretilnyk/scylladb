@@ -267,6 +267,13 @@ public:
 
     future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, sstring prefix, utils::chunked_vector<sstring> manifests);
 
+    future<tasks::task_id> upload_tablets_task(table_id, sstring keyspace, sstring table,
+            std::optional<size_t> target_tablet_count, bool primary_replica_only);
+
+    // Aborts the table's cluster upload: every local cluster_upload task for it, whether or not
+    // its request exists yet, and then the request itself.
+    future<> abort_upload(table_id);
+
     future<sstables::sstable_state> upload_destination_state(replica::table&);
 
     replica::database& local_db() {
@@ -276,6 +283,7 @@ public:
     class download_task_impl;
     class progress_reporting_task_impl;
     class tablet_restore_task_impl;
+    class cluster_upload_task_impl;
 };
 
 template <>
