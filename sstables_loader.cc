@@ -953,11 +953,713 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
             return sl.local().prepare_upload(table);
         });
     });
+    // stream_blob_handler() looks ops_id up in a node-local map only the initiator populates, so
+    // migration has the destination start the transfer. Cluster upload cannot - only the sender
+    // knows what is in its upload directory - so it asks the receiver to register the id first.
+    ser::sstables_loader_rpc_verbs::register_upload_stream_session(&_messaging, [this] (raft::server_id dst_id, utils::UUID ops_id, bool start) -> future<upload_stream_session_result> {
+        return _ss.local().handle_raft_rpc(dst_id, [ops_id, start] (auto&) -> future<> {
+            auto id = streaming::file_stream_id(ops_id);
+            if (start) {
+                co_await streaming::mark_tablet_stream_start(id);
+            } else {
+                co_await streaming::mark_tablet_stream_done(id);
+            }
+        }).then([] {
+            return make_ready_future<upload_stream_session_result>();
+        });
+    });
+    ser::sstables_loader_rpc_verbs::register_upload_tablet(&_messaging, [this] (raft::server_id dst_id, locator::global_tablet_id gid, std::vector<uint32_t> source_shards) -> future<upload_tablet_result> {
+        return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), gid, source_shards = std::move(source_shards)] (auto&) mutable {
+            return sl.local().do_upload_tablet(gid, std::move(source_shards));
+        });
+    });
 }
 
 future<> sstables_loader::stop() {
     co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
     co_await _task_manager_module->stop();
+}
+
+// Where an uploaded sstable of this table lands: past the view-update path it is a normal
+// sstable, otherwise it goes to staging so view building sees it.
+future<sstables::sstable_state> sstables_loader::upload_destination_state(replica::table& tbl) {
+    auto decision = co_await db::view::check_needs_view_update_path(_view_builder.local(),
+            _db.local().get_token_metadata_ptr(), tbl, streaming::stream_reason::repair);
+    co_return decision == db::view::sstable_destination_decision::normal_directory
+            ? sstables::sstable_state::normal : sstables::sstable_state::staging;
+}
+
+future<> sstables_loader::ensure_upload_session(utils::UUID request_id, ::table_id table_id) {
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [request_id, table_id] (sstables_loader& loader) {
+            return loader.ensure_upload_session(request_id, table_id);
+        });
+    }
+
+    auto units = co_await get_units(_prepare_upload_sem, 1);
+    if (_upload_sessions.contains(request_id)) {
+        co_return;
+    }
+    if (_draining_upload_sessions.contains(request_id)) {
+        // finish_upload() unpublished this request's sessions and is tearing them down; it released
+        // the semaphore between those steps, which is what let this call in. Opening now would
+        // publish a session nothing will ever tear down.
+        throw std::runtime_error(fmt::format(
+                "Upload request {} is being torn down", request_id));
+    }
+
+    auto& tbl = _db.local().find_column_family(table_id);
+    auto s = tbl.schema();
+    llog.info("Opening upload directory of {}.{} for upload request {}", s->ks_name(), s->cf_name(), request_id);
+
+    sstables::sstable_open_config cfg {
+        .load_bloom_filter = false,
+    };
+    auto [tid, sstables_on_shards] = co_await replica::distributed_loader::get_sstables_from_upload_dir(
+            _db, s->ks_name(), s->cf_name(), cfg);
+
+    co_await container().invoke_on_all([request_id, table_id, &sstables_on_shards] (sstables_loader& loader) {
+        auto session = make_lw_shared<upload_session>();
+        session->table = table_id;
+        session->sstables = std::move(sstables_on_shards[this_shard_id()]);
+        std::ranges::sort(session->sstables, [] (const sstables::shared_sstable& x, const sstables::shared_sstable& y) {
+            return x->compare_by_first_key(*y) < 0;
+        });
+        loader._upload_sessions.emplace(request_id, std::move(session));
+    });
+}
+
+future<> sstables_loader::finish_upload(utils::UUID request_id, bool unlink_consumed) {
+    if (this_shard_id() != 0) {
+        // Driven from shard 0 so it can take _prepare_upload_sem below.
+        co_return co_await container().invoke_on(0, [request_id, unlink_consumed] (sstables_loader& loader) {
+            return loader.finish_upload(request_id, unlink_consumed);
+        });
+    }
+
+    // Serialised against ensure_upload_session(), which holds this while it scans the upload
+    // directory. Without that, a FINISH_UPLOAD arriving mid-scan finds no session to tear down
+    // - the scan has not published one yet - reports success, and the scan then emplaces
+    // sessions on every shard that nothing will ever ask about again, because the request is
+    // retired by then. Every shard would hold the whole upload directory open, sstables and
+    // file handles included, for the life of the process. Reachable whenever a request is
+    // completed while a node is starting its first transition for it: a source node leaving,
+    // or an abort.
+    auto units = co_await get_units(_prepare_upload_sem, 1);
+
+    // Every shard holds its own slice of the request's opened upload directory, so the
+    // teardown has to reach all of them. Idempotent: a request that was already cleaned
+    // up, or one this node never had work for, is a no-op.
+    co_await container().invoke_on_all([request_id, unlink_consumed] (sstables_loader& loader) -> future<> {
+        auto it = loader._upload_sessions.find(request_id);
+        if (it == loader._upload_sessions.end()) {
+            co_return;
+        }
+        auto session = std::move(it->second);
+        loader._upload_sessions.erase(it);
+
+        if (!unlink_consumed) {
+            // Aborted or failed: leave the files where they are so the operator can retry
+            // or inspect them. Dropping the session is still right - a retry rescans. Nothing
+            // here is marked for deletion, so letting the session go really does leave them.
+            llog.info("Upload request {} torn down on shard {}, {} sstables left in place",
+                    request_id, this_shard_id(), session->sstables.size());
+            co_return;
+        }
+
+        // Sstables wholly inside one tablet were unlinked as their transition streamed.
+        // The rest were only recorded, because neighbouring tablets still needed them, and
+        // this is the first point at which no remaining work can reference them. This
+        // mirrors node-local load-and-stream, which likewise unlinks only once every
+        // tablet has been streamed.
+        size_t marked = 0;
+        for (auto& sst : session->sstables) {
+            // Skip anything already handled incrementally as its last overlapping tablet
+            // finished; only the leftovers of an incomplete request remain here.
+            if (session->streamed.contains(sst.get()) && !session->unlinked.contains(sst.get())) {
+                marked++;
+                // Deferred, not an immediate unlink: a concurrent reader may hold a reference
+                // to the same object. Removal follows the last reference, as compaction does.
+                sst->mark_for_deletion();
+                session->unlinked.insert(sst.get());
+            }
+        }
+        llog.info("Upload request {} finished on shard {}, marked {} of {} sstables for deletion",
+                request_id, this_shard_id(), marked, session->sstables.size());
+    });
+}
+
+// Phase 2: pull the tablet's range from the primary by file streaming - the mechanism tablet
+// migration uses, driven from the destination. Sstable state is carried across, so one still in
+// staging on the primary arrives in staging here and this replica registers its own view building
+// work. That is required: view updates are generated per base replica.
+future<size_t> sstables_loader::attach_local_upload_sstables(locator::global_tablet_id gid,
+        shard_id owning_shard, std::vector<sstables::shared_sstable>& fully_contained,
+        upload_session& session) {
+    // Not just fully_contained: a previous attempt may have moved sstables out without finishing
+    // the attach, and those are marked consumed, so classification no longer offers them.
+    auto pending_it = session.pending_attach.find(gid.tablet.value());
+    bool has_pending = pending_it != session.pending_attach.end() && !pending_it->second.empty();
+    auto register_it = session.pending_register.find(gid.tablet.value());
+    bool has_register = register_it != session.pending_register.end() && !register_it->second.empty();
+    if (fully_contained.empty() && !has_pending && !has_register) {
+        co_return 0;
+    }
+    // Held from before the first file leaves the upload directory until the attach is recorded.
+    // finish_upload() closes this gate before reading pending_attach, so it cannot observe a
+    // half-done attach or unlink a file already in the table.
+    auto attach_hold = session.attach_gate.hold();
+    auto& tbl = _db.local().find_column_family(gid.table);
+
+    auto state = co_await upload_destination_state(tbl);
+
+    auto& pending = session.pending_attach[gid.tablet.value()];
+
+    // Move each file out under a fresh generation - nothing is read or re-encoded. Version and
+    // format travel with it: they vary per sstable, and reopening with the wrong ones does not
+    // describe the file on disk.
+    for (auto& sst : fully_contained) {
+        auto gen = tbl.get_sstable_generation_generator()();
+        auto version = sst->get_version();
+        auto format = sst->get_format();
+        co_await sst->pick_up_from_upload(state, gen);
+        session.consumed.insert(sst.get());
+        pending.push_back(upload_session::moved_sstable{gen, version, format, state, owning_shard});
+    }
+    auto taken = fully_contained.size();
+    fully_contained.clear();
+
+    // Attached on the shard owning the tablet, which need not be the shard that opened them.
+    // attached counts how many of pending are in the table: add_sstables_and_update_cache() is a
+    // loop, so re-adding on a retry would give the table two sstables over the same files.
+    size_t attached = 0;
+    std::exception_ptr ex;
+    try {
+        co_await container().invoke_on(owning_shard, [gid, &pending, &attached]
+                (sstables_loader& loader) -> future<> {
+            auto& tbl = loader._db.local().find_column_family(gid.table);
+            auto& sst_manager = tbl.get_sstables_manager();
+            auto erm = tbl.get_effective_replication_map();
+            for (size_t i = 0; i < pending.size(); i++) {
+                if (i > 0) {
+                    utils::get_local_injector().inject("upload_attach_fail_once", [] {
+                        throw std::runtime_error("upload_attach_fail_once");
+                    });
+                }
+                const auto& m = pending[i];
+                auto sst = sst_manager.make_sstable(tbl.schema(), tbl.get_storage_options(), m.generation,
+                        m.state, m.version, m.format);
+                co_await sst->load(erm->get_sharder(*tbl.schema()));
+                co_await tbl.add_sstables_and_update_cache({sst});
+                attached = i + 1;
+            }
+            llog.debug("Attached {} upload sstables directly for tablet {} on owning shard {}",
+                    pending.size(), gid, this_shard_id());
+        });
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    // Record them as owing registration before dropping them from the attach list: erasing the
+    // attach record with it still owed would report success with no view built.
+    {
+        std::vector<upload_session::moved_sstable> newly_staged;
+        for (size_t i = 0; i < attached; i++) {
+            if (pending[i].state == sstables::sstable_state::staging) {
+                newly_staged.push_back(pending[i]);
+            }
+        }
+        if (!newly_staged.empty()) {
+            auto& owed = session.pending_register[gid.tablet.value()];
+            owed.insert(owed.end(), newly_staged.begin(), newly_staged.end());
+        }
+    }
+    pending.erase(pending.begin(), pending.begin() + attached);
+    auto remaining = pending.size();
+    if (remaining == 0) {
+        session.pending_attach.erase(gid.tablet.value());
+    }
+    if (ex) {
+        llog.warn("Attaching upload sstables for tablet {} on shard {} failed after {} of them were "
+                "attached, {} left for the retry: {}", gid, this_shard_id(), attached, remaining, ex);
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+
+    // Re-found by generation, since the objects that attached them are gone.
+    // register_staging_sstable_tasks() only queues, and queues nothing if it threw, so re-running
+    // neither double-registers nor loses any.
+    if (auto owed_it = session.pending_register.find(gid.tablet.value());
+            owed_it != session.pending_register.end() && !owed_it->second.empty()) {
+        co_await container().invoke_on(owning_shard, [gid, owed = owed_it->second]
+                (sstables_loader& loader) -> future<> {
+            auto& tbl = loader._db.local().find_column_family(gid.table);
+            auto all_sstables = tbl.get_sstables();
+            std::vector<sstables::shared_sstable> staged;
+            for (const auto& m : owed) {
+                for (const auto& sst : *all_sstables) {
+                    if (sst->generation() == m.generation) {
+                        staged.push_back(sst);
+                        break;
+                    }
+                }
+            }
+            if (!staged.empty()) {
+                co_await loader._view_building_worker.local().register_staging_sstable_tasks(
+                        std::move(staged), tbl.schema()->id());
+            }
+        });
+        session.pending_register.erase(gid.tablet.value());
+    }
+    co_return taken;
+}
+
+// Same-host path for the sstables which straddle the tablet's boundary.
+//
+// Only part of each belongs to this tablet, so unlike a fully contained one it cannot just be
+// moved. But when this node is the primary there is no reason to put the rows on the wire either:
+// read the inputs restricted to the tablet's range and write the result straight into a new
+// sstable, on the shard which has the directory open and can read them.
+//
+// A retry re-combines and re-writes, as a retried stream re-sends: the inputs are not consumed as
+// they go, because neighbouring tablets still need them. Harmless for ordinary data and wrong for
+// counters - the same caveat the streaming path carries.
+future<size_t> sstables_loader::combine_local_upload_sstables(locator::global_tablet_id gid,
+        shard_id owning_shard, const dht::token_range& tablet_range,
+        std::vector<sstables::shared_sstable>& partially_contained, upload_session& session) {
+    if (partially_contained.empty()) {
+        co_return 0;
+    }
+    auto& tbl = _db.local().find_column_family(gid.table);
+    auto s = tbl.schema();
+
+    auto state = co_await upload_destination_state(tbl);
+
+    auto pr = dht::to_partition_range(tablet_range);
+    auto token_range = pr.transform(std::mem_fn(&dht::ring_position::token));
+
+    auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, token_range));
+    uint64_t estimated_partitions = 0;
+    for (auto& sst : partially_contained) {
+        estimated_partitions += co_await sst->estimated_keys_for_range(token_range);
+        sst_set->insert(sst);
+    }
+
+    // Overlapping the tablet by token bounds does not imply holding a partition inside it, and an
+    // sstable with no partitions cannot be produced at all - seal_summary() rejects it and the BTI
+    // writer dereferences an unset first key. peek() leaves the fragment for write_components() to
+    // consume, so nothing is read twice.
+    auto permit = co_await _db.local().obtain_reader_permit(tbl, "sstables_loader::upload_combine", db::no_timeout, {});
+    auto reader = tbl.make_streaming_reader(s, std::move(permit), pr, sst_set, gc_clock::now());
+    bool empty = false;
+    std::exception_ptr ex;
+    try {
+        empty = co_await reader.peek() == nullptr;
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    if (ex || empty) {
+        // write_components() takes the reader and closes it; on these two paths it never gets it.
+        co_await reader.close();
+        if (ex) {
+            co_await coroutine::return_exception_ptr(std::move(ex));
+        }
+        llog.debug("Nothing of tablet {} was found in the {} boundary-straddling sstables on shard {}",
+                gid, partially_contained.size(), this_shard_id());
+        for (auto& in : partially_contained) {
+            session.streamed.insert(in.get());
+        }
+        auto skipped = partially_contained.size();
+        partially_contained.clear();
+        co_return skipped;
+    }
+
+    // owning_shard was read before this transition started, and a migration or resize since then
+    // can have moved the tablet. One map read against the whole cost of the rewrite.
+    {
+        auto erm_now = tbl.get_effective_replication_map();
+        const auto& tablets_now = erm_now->get_token_metadata().tablets();
+        auto self = _ss.local().get_token_metadata().get_topology().my_host_id();
+        std::optional<shard_id> owner_now;
+        if (tablets_now.has_tablet_map(gid.table)) {
+            const auto& tmap_now = tablets_now.get_tablet_map(gid.table);
+            if (gid.tablet.value() < tmap_now.tablet_count()) {
+                for (auto&& r : tmap_now.get_tablet_info(gid.tablet).replicas) {
+                    if (r.host == self) {
+                        owner_now = r.shard;
+                        break;
+                    }
+                }
+            }
+        }
+        if (owner_now != owning_shard) {
+            throw std::runtime_error(fmt::format("Tablet {} is no longer owned by shard {} on this "
+                    "node (now {}); the tablet map changed before the combine started. Failing the "
+                    "transition so it is retried against the current map.",
+                    gid, owning_shard,
+                    owner_now ? fmt::to_string(*owner_now) : "not a replica here"));
+        }
+    }
+
+    auto sst = state == sstables::sstable_state::normal
+            ? tbl.make_streaming_sstable_for_write() : tbl.make_streaming_staging_sstable();
+    auto cfg = tbl.get_sstables_manager().configure_writer(sstables::repair_origin);
+    cfg.leave_unsealed = true;
+
+    try {
+        co_await sst->write_components(std::move(reader), estimated_partitions, s, cfg, encoding_stats{});
+        co_await sst->open_data();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    if (ex) {
+        co_await sst->unlink();
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+
+    auto taken = partially_contained.size();
+    auto generation = sst->generation();
+    auto version = sst->get_version();
+    auto format = sst->get_format();
+    llog.debug("Combined {} boundary-straddling sstables of tablet {} into one on shard {}, attaching on shard {}",
+            taken, gid, this_shard_id(), owning_shard);
+
+    std::exception_ptr attach_ex;
+    std::exception_ptr add_ex;
+    try {
+        add_ex = co_await container().invoke_on(owning_shard, [gid, state, generation, version, format]
+                (sstables_loader& loader) -> future<std::exception_ptr> {
+            auto& tbl = loader._db.local().find_column_family(gid.table);
+            auto& sst_manager = tbl.get_sstables_manager();
+            auto sst = sst_manager.make_sstable(tbl.schema(), tbl.get_storage_options(), generation,
+                    state, version, format);
+            sst->set_sstable_level(0);
+            auto units = co_await sst_manager.dir_semaphore().get_units(1);
+            sstables::sstable_open_config ocfg {
+                .unsealed_sstable = true,
+            };
+            // Held for the duration of the load, not read inline: load() takes the sharder by
+            // reference and the sharder belongs to the map, which an upload replaces constantly.
+            auto erm = tbl.get_effective_replication_map();
+            auto s = tbl.schema();
+            co_await sst->load(erm->get_sharder(*s), ocfg);
+
+            // owning_shard and tablet_range were captured before the combine, but the sharder above
+            // is read live. If the tablet has since moved, add_new_sstable_and_update_cache() would
+            // trip belongs_to_other_shard and take the node down. Refuse; the retry recombines.
+            const auto& shards = sst->get_shards_for_this_sstable();
+            if (shards.size() != 1 || shards[0] != this_shard_id()) {
+                throw std::runtime_error(fmt::format(
+                        "Combined sstable of tablet {} belongs to shards {{{}}} under the current "
+                        "tablet map, not solely to shard {} it is being attached on; the tablet map "
+                        "changed during the upload. Failing the transition so it is retried against "
+                        "the current map.", gid, fmt::join(shards, ","), this_shard_id()));
+            }
+
+            std::exception_ptr add_ex;
+            try {
+                auto attached = co_await tbl.add_new_sstable_and_update_cache(sst,
+                        [&sst_manager, sst] (sstables::shared_sstable loading_sst) -> future<> {
+                    if (loading_sst == sst) {
+                        auto writer_cfg = sst_manager.configure_writer(loading_sst->get_origin());
+                        co_await loading_sst->seal_sstable(writer_cfg.backup);
+                    }
+                });
+                if (state == sstables::sstable_state::staging) {
+                    co_await loader._view_building_worker.local().register_staging_sstable_tasks(attached, tbl.schema()->id());
+                }
+            } catch (...) {
+                add_ex = std::current_exception();
+            }
+            if (add_ex) {
+                // The owning shard owns this file's deletion from here. Hand the error back rather
+                // than throwing, so the writer does not unlink the same file a second time.
+                llog.warn("Attaching the combined sstable of tablet {} on shard {} failed: {}",
+                        gid, this_shard_id(), add_ex);
+                sst->mark_for_deletion();
+            }
+            co_return add_ex;
+        });
+    } catch (...) {
+        attach_ex = std::current_exception();
+    }
+    if (attach_ex) {
+        // Nothing was committed - the owning shard failed before taking ownership of the file.
+        co_await sst->unlink();
+        co_await coroutine::return_exception_ptr(std::move(attach_ex));
+    }
+    if (add_ex) {
+        // Already marked for deletion under the committed name by the owning shard.
+        co_await coroutine::return_exception_ptr(std::move(add_ex));
+    }
+
+    // The owning shard sealed and attached a separate object over this file, so it is committed.
+    // This object still carries the implicit deletion mark get_writer() set for an unsealed
+    // sstable, and its destruction below would unlink the committed file under a live reader.
+    sst->mark_committed();
+
+    for (auto& in : partially_contained) {
+        session.streamed.insert(in.get());
+    }
+    partially_contained.clear();
+    co_return taken;
+}
+
+future<upload_tablet_result> sstables_loader::do_upload_tablet(locator::global_tablet_id gid,
+        std::vector<uint32_t> source_shards) {
+    co_await coroutine::switch_to(_sched_group);
+
+    // Recorded when PREPARE scanned this node and arriving back over the wire. A node restarted
+    // with fewer shards still has rows naming shards it no longer has, and invoke_on() past
+    // the shard count indexes out of bounds. Rejected before the barrier, so the coordinator
+    // sees a failed transition instead of the node going down.
+    for (auto shard : source_shards) {
+        if (shard >= this_smp_shard_count()) {
+            throw std::runtime_error(fmt::format("Upload of tablet {} names source shard {}, but "
+                    "this node has {} shards. The request was prepared against a different shard "
+                    "count; abort it and start a new one.", gid, shard, this_smp_shard_count()));
+        }
+    }
+    // do_tablet_operation() takes a group0 read barrier and group0 only exists on shard 0. The
+    // streaming runs on the shards which opened the sstables, each taking its own guard there.
+    co_await _ss.local().do_tablet_operation(gid, "Upload", [this, gid, source_shards = std::move(source_shards)]
+            (locator::tablet_metadata_guard&) -> future<service::tablet_operation_result> {
+        // Sequential: the shards write to the same destination replica, and the batch was sized on
+        // the total.
+        for (auto shard : source_shards) {
+            co_await container().invoke_on(shard, [gid] (sstables_loader& loader) {
+                return loader.stream_tablet_from_upload_dir(gid);
+            });
+        }
+        co_return service::tablet_operation_empty_result{};
+    });
+    co_return upload_tablet_result{};
+}
+
+future<> sstables_loader::stream_tablet_from_upload_dir(locator::global_tablet_id gid) {
+    auto& tbl = _db.local().find_column_family(gid.table);
+    // table::stop() waits for this, so a DROP TABLE during the transition cannot pull the table
+    // out from under the reads and writes below; the metadata guard alone keeps only the object.
+    auto stream_guard = tbl.stream_in_progress();
+    locator::tablet_metadata_guard guard(tbl, gid);
+
+    // Copied out before the first deferring point: get_tablet_map() is only valid until then, and
+    // the transition info it hands back is a pointer into that map.
+    service::session_id session_id;
+    locator::tablet_upload_info upload_info;
+    dht::token_range tablet_range;
+    utils::UUID request_id;
+    shard_id primary_shard = 0;
+    {
+        auto& tmap = guard.get_tablet_map();
+        auto* trinfo = tmap.get_tablet_transition_info(gid.tablet);
+        if (!trinfo) {
+            throw std::runtime_error(fmt::format("No transition info for tablet {}", gid));
+        }
+        if (trinfo->stage != locator::tablet_transition_stage::upload) {
+            throw std::runtime_error(fmt::format("Tablet {} stage is not at upload", gid));
+        }
+        if (!trinfo->session_id) {
+            throw std::runtime_error(fmt::format("Upload of tablet {} was aborted", gid));
+        }
+        if (!trinfo->upload_info) {
+            throw std::runtime_error(fmt::format("Upload transition of tablet {} has no endpoints", gid));
+        }
+        if (!trinfo->upload_info->primary_host) {
+            // Guards against a field being added to the transition without being persisted: the
+            // default is a null host, whose address lookup fails a long way from the cause.
+            throw std::runtime_error(fmt::format("Upload transition of tablet {} has no target replica", gid));
+        }
+        session_id = trinfo->session_id;
+        upload_info = *trinfo->upload_info;
+        request_id = upload_info.request_id;
+        tablet_range = tmap.get_token_range(gid.tablet);
+        if (!request_id) {
+            throw std::runtime_error(fmt::format("Upload transition of tablet {} names no request", gid));
+        }
+        // From the replica set rather than the transition, so a tablet which migrated since is
+        // streamed to where it now lives.
+        auto& tinfo = tmap.get_tablet_info(gid.tablet);
+        auto primary = std::ranges::find_if(tinfo.replicas,
+                [&] (auto& r) { return r.host == upload_info.primary_host; });
+        if (primary == tinfo.replicas.end()) {
+            throw std::runtime_error(fmt::format("Upload target {} is no longer a replica of tablet {}",
+                    upload_info.primary_host, gid));
+        }
+        primary_shard = primary->shard;
+    }
+
+    service::session_topology_guard session_guard(session_id);
+
+    co_await ensure_upload_session(request_id, gid.table);
+    auto it = _upload_sessions.find(request_id);
+    if (it == _upload_sessions.end()) {
+        throw std::runtime_error(fmt::format("No upload session {} on shard {}", request_id, this_shard_id()));
+    }
+    auto session = it->second;
+    // What an earlier transition already took out is no longer a candidate: upload RPCs are
+    // retried, and without this the retry re-selects a moved file and the node aborts on the
+    // missing TOC.
+    std::vector<sstables::shared_sstable> candidates;
+    candidates.reserve(session->sstables.size());
+    for (const auto& sst : session->sstables) {
+        if (!session->consumed.contains(sst.get()) && !session->unlinked.contains(sst.get())) {
+            candidates.push_back(sst);
+        }
+    }
+    auto [fully, partially] = co_await get_sstables_for_tablet(candidates, tablet_range,
+            [] (const auto& sst) { return sst->get_first_decorated_key().token(); },
+            [] (const auto& sst) { return sst->get_last_decorated_key().token(); });
+
+    // Not the classification alone: a previous attempt may have moved sstables out and failed
+    // before attaching them. Returning here would retire their work row and lose them.
+    auto pending_it = session->pending_attach.find(gid.tablet.value());
+    bool has_pending_attach = pending_it != session->pending_attach.end()
+            && !pending_it->second.empty();
+    auto register_it = session->pending_register.find(gid.tablet.value());
+    bool has_pending_register = register_it != session->pending_register.end()
+            && !register_it->second.empty();
+
+    if (fully.empty() && partially.empty() && !has_pending_attach && !has_pending_register) {
+        llog.debug("Upload of tablet {} has nothing to stream on shard {}", gid, this_shard_id());
+        co_return;
+    }
+    if (has_pending_attach) {
+        llog.info("Upload of tablet {} on shard {} is resuming {} unfinished attach(es)",
+                gid, this_shard_id(), pending_it->second.size());
+    }
+
+    llog.debug("Uploading tablet {} from shard {}: {} fully contained, {} partially contained sstables",
+            gid, this_shard_id(), fully.size(), partially.size());
+
+    // Held open by tests across node joins and coordinator handovers. The timeout is a last
+    // resort only: wait_for_message() reports it via on_internal_error, which aborts the node
+    // under the test harness, so it must exceed every deadline a test can wait under.
+    co_await utils::get_local_injector().inject("upload_tablet_before_transport",
+            utils::wait_for_message(std::chrono::minutes(10)));
+
+    // Kept for the removal pass at the end, once the transports have consumed the vectors.
+    auto partially_streamed = partially;
+
+    auto self = _ss.local().get_token_metadata().get_topology().my_host_id();
+    if (upload_info.primary_host == self) {
+        // The wire transports below take the session's abort source; the local attach is a few
+        // renames checked here, and combine checks it again around its rewrite.
+        session_guard.check();
+        // primary_shard was resolved from the replica list above, which cannot change while the
+        // tablet's own transition is in flight - this host owns the tablet at that shard.
+        // Called even with nothing fully contained: only attach knows about sstables a previous
+        // attempt moved but did not attach.
+        auto taken = co_await attach_local_upload_sstables(gid, primary_shard, fully, *session);
+        if (taken) {
+            llog.debug("Attached {} fully contained sstables locally for tablet {}", taken, gid);
+        }
+        if (!partially.empty()) {
+            co_await combine_local_upload_sstables(gid, primary_shard, tablet_range, partially, *session);
+        }
+    }
+
+    // Different host: send fully contained sstables as files rather than decoding them into
+    // mutations and re-encoding them on the far side.
+    if (upload_info.primary_host != self && !fully.empty()) {
+        auto target_state = co_await upload_destination_state(tbl);
+
+        auto ops_id = streaming::file_stream_id::create_random_id();
+        auto dst = raft::server_id(upload_info.primary_host.uuid());
+
+        co_await ser::sstables_loader_rpc_verbs::send_upload_stream_session(
+                &_messaging, upload_info.primary_host, dst, ops_id.uuid(), true);
+        auto close_session = seastar::defer([this, host = upload_info.primary_host, dst, ops_id] () noexcept {
+            // send_message() resolves the host's address before it returns a future, and throws
+            // if the host has since left the address map; in a noexcept body that is a crash.
+            try {
+                (void)ser::sstables_loader_rpc_verbs::send_upload_stream_session(
+                        &_messaging, host, dst, ops_id.uuid(), false)
+                    .handle_exception([ops_id] (std::exception_ptr ex) {
+                        llog.warn("Failed to close upload stream session {}: {}", ops_id, ex);
+                        return upload_stream_session_result{};
+                    });
+            } catch (...) {
+                llog.warn("Failed to close upload stream session {}: {}", ops_id, std::current_exception());
+            }
+        });
+
+        auto permit = co_await _db.local().obtain_reader_permit(tbl, "sstables_loader::upload_file_stream", db::no_timeout, {});
+        auto infos = co_await streaming::make_sstable_stream_infos(tbl, fully, ops_id, std::move(permit), target_state);
+
+        // Where the sstables are attached, so it has to own the tablet. Not where the bytes are
+        // written: messaging listens with load_balancing_algorithm::port, so the receiving shard is
+        // whichever the STREAM_BLOB connection landed on.
+        std::vector<streaming::node_and_shard> targets{
+            streaming::node_and_shard{upload_info.primary_host, primary_shard}};
+        llog.debug("upload_file_stream[{}] sending {} fully contained sstables of tablet {} to {}, attaching on shard {}",
+                ops_id, fully.size(), gid, upload_info.primary_host, primary_shard);
+        // No topology guard on the wire: the receiver validates one against its own session table,
+        // and the upload request's session is not open there. Abort therefore takes effect on the
+        // sending side, via the session's abort source, checked between chunks.
+        auto bytes = co_await streaming::tablet_stream_files(_messaging, std::move(infos), std::move(targets),
+                gid.table, ops_id, service::null_topology_guard, false, &session_guard.abort_source());
+        llog.debug("upload_file_stream[{}] tablet {} sent, {} bytes", ops_id, gid, bytes);
+
+        for (auto& sst : fully) {
+            if (!session->unlinked.contains(sst.get())) {
+                session->unlinked.insert(sst.get());
+                co_await sst->unlink();
+            }
+        }
+        fully.clear();
+    }
+
+    // Whatever is left goes over the network - nothing, when this node is the primary. A retried
+    // transition re-sends these: they straddle the boundary, so unlike the fully contained ones
+    // they are not consumed as they go. Replaying a mutation is harmless for ordinary data but not
+    // for counters, and here the coordinator retries automatically.
+    if (!fully.empty() || !partially.empty()) {
+        auto owned = fully;
+        owned.insert(owned.end(), partially.begin(), partially.end());
+        auto streamer = tablet_sstable_streamer(_messaging, _db, gid.table, guard.get_erm(), std::move(owned),
+                primary_replica_only::no, unlink_sstables::no, stream_scope::all);
+        streamer.set_explicit_target(upload_info.primary_host);
+        streamer.set_abort_source(session_guard.abort_source());
+        co_await streamer.stream_one_tablet(tablet_range, std::move(fully), std::move(partially), {});
+    }
+
+    // A straddler can only go once this shard has streamed every tablet it overlaps, which is
+    // knowable locally because work items are per (node, shard, tablet). The space comes back only
+    // at teardown: the session keeps its own reference, and dropping it here is not possible while
+    // the sstable list is immutable.
+    session->completed_tablets.insert(gid.tablet.value());
+    for (auto& sst : partially_streamed) {
+        session->streamed.insert(sst.get());
+    }
+
+    // Decide before removing: the tablet map reference is only valid until the next deferring
+    // point, and unlinking defers.
+    std::vector<sstables::shared_sstable> to_remove;
+    {
+        auto& tmap_now = guard.get_tablet_map();
+        for (auto& sst : partially_streamed) {
+            if (session->unlinked.contains(sst.get())) {
+                continue;
+            }
+            auto first_tablet = tmap_now.get_tablet_id(sst->get_first_decorated_key().token());
+            auto last_tablet = tmap_now.get_tablet_id(sst->get_last_decorated_key().token());
+            bool all_done = true;
+            for (auto id = first_tablet; id <= last_tablet; id = locator::tablet_id(id.value() + 1)) {
+                if (!session->completed_tablets.contains(id.value())) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) {
+                session->unlinked.insert(sst.get());
+                to_remove.push_back(sst);
+            }
+        }
+    }
+    for (auto& sst : to_remove) {
+        llog.debug("Marking upload sstable {} for deletion: all overlapping tablets streamed on shard {}",
+                sst->get_filename(), this_shard_id());
+        sst->mark_for_deletion();
+    }
 }
 
 future<sstables_loader::upload_measurement> sstables_loader::measure_upload_slice(::table_id table_id,
