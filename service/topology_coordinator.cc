@@ -17,6 +17,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/util/noncopyable_function.hh>
@@ -1473,10 +1474,6 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             co_await _group0.client().add_entry(std::move(g0_cmd), std::move(guard), _as);
         }
         break;
-        case global_topology_request::upload_tablets: {
-            // Nothing queues this yet; the coordinator learns to prepare the work later.
-            break;
-        }
         case global_topology_request::restore_tablets: {
             rtlogger.info("restore_tablets requested");
 
@@ -1530,7 +1527,239 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             co_await update_topology_state(std::move(guard), std::move(updates), "restore_tablets: set up tablet transitions");
         }
         break;
+        case global_topology_request::upload_tablets: {
+            auto table = *req_entry.upload_table_id;
+            rtlogger.info("upload_tablets requested for table {}", table);
+            co_await handle_upload_tablets_request(std::move(guard), req_id, table);
         }
+        break;
+        }
+    }
+
+    // Measures every node's upload directory and writes the work list the scheduler consumes.
+    // Consumes the guard and takes fresh ones: nodes x tablets does not fit one group0 command.
+    // The request starts only once the list is written; re-entry clears stale rows and rescans.
+
+    // Best effort on purpose: an unreachable node keeps its session until it restarts, which
+    // wastes memory but loses no data. Parallel and timed out, so one node costs one timeout.
+    future<> drain_upload_finishes(std::vector<upload_completion_info> pending) {
+        if (pending.empty()) {
+            co_return;
+        }
+        std::vector<raft::server_id> nodes;
+        for (const auto& [node_id, _] : _topo_sm._topology.normal_nodes) {
+            // A node gossip already knows is down would only cost the timeout; it drops its
+            // session when it restarts, which is the best-effort outcome for it either way.
+            if (is_excluded(node_id) || !_gossiper.is_alive(locator::host_id(node_id.uuid()))) {
+                rtlogger.info("Not sending FINISH_UPLOAD to {}: node is down or excluded", node_id);
+                continue;
+            }
+            nodes.push_back(node_id);
+        }
+        constexpr auto finish_upload_timeout = std::chrono::minutes(2);
+        constexpr size_t max_concurrent_finishes = 16;
+        for (const auto& completion : pending) {
+            _as.check();
+            co_await max_concurrent_for_each(nodes, max_concurrent_finishes,
+                    [&, request_id = completion.request_id, succeeded = completion.error.empty()]
+                    (raft::server_id node_id) -> future<> {
+                auto host = locator::host_id(node_id.uuid());
+                std::exception_ptr ex;
+                try {
+                    co_await ser::sstables_loader_rpc_verbs::send_finish_upload(
+                            &_messaging, host, netw::messaging_service::clock_type::now() + finish_upload_timeout,
+                            node_id, request_id, succeeded);
+                } catch (...) {
+                    ex = std::current_exception();
+                }
+                if (ex) {
+                    rtlogger.warn("Failed to finish upload request {} on {}: {}", request_id, host, ex);
+                }
+            });
+        }
+    }
+
+    future<> handle_upload_tablets_request(group0_guard guard, utils::UUID req_id, table_id table) {
+        auto fail = [&] (group0_guard g, sstring error) -> future<> {
+            rtlogger.warn("upload_tablets request {} failed: {}", req_id, error);
+            utils::chunked_vector<canonical_mutation> updates;
+            updates.emplace_back(
+                    topology_mutation_builder(g.write_timestamp())
+                        .del_global_topology_request()
+                        .del_global_topology_request_id()
+                        .drop_first_global_topology_request_id(_topo_sm._topology.global_requests_queue, req_id)
+                        .build());
+            updates.emplace_back(make_upload_work_clear_mutation(g.write_timestamp(), req_id));
+            updates.emplace_back(make_upload_tablet_state_clear_mutation(g.write_timestamp(), req_id));
+            updates.emplace_back(
+                    topology_request_tracking_mutation_builder(req_id).done(error).build());
+            co_await update_topology_state(std::move(g), std::move(updates), "upload_tablets: fail request");
+        };
+
+        // A queued request is not in ongoing_upload_requests yet, so an abort can only record
+        // its outcome on the tracking row. Checked before the scan, which costs minutes.
+        auto aborted = [this, req_id] () -> future<sstring> {
+            auto entry = co_await _sys_ks.get_topology_request_entry(req_id);
+            co_return entry.error;
+        };
+
+        if (auto error = co_await aborted(); !error.empty()) {
+            co_return co_await fail(std::move(guard), std::move(error));
+        }
+
+        if (!_db.column_family_exists(table)) {
+            co_return co_await fail(std::move(guard), format("Table {} does not exist", table));
+        }
+        if (!get_token_metadata().tablets().has_tablet_map(table)) {
+            co_return co_await fail(std::move(guard), format("Table {} does not use tablets", table));
+        }
+        if (!get_token_metadata().tablets().is_base_table(table)) {
+            // Its transitions would have to be written into the base table's map, keyed by a
+            // table that is not the one being uploaded; the mutation would be rejected by group0
+            // validation every pass.
+            co_return co_await fail(std::move(guard), format("Table {} is co-located with {}; cluster upload "
+                    "supports base tables only", table, get_token_metadata().tablets().get_base_table(table)));
+        }
+
+        {
+            utils::chunked_vector<canonical_mutation> updates;
+            updates.emplace_back(make_upload_work_clear_mutation(guard.write_timestamp(), req_id));
+            updates.emplace_back(make_upload_tablet_state_clear_mutation(guard.write_timestamp(), req_id));
+            co_await update_topology_state(std::move(guard), std::move(updates), "upload_tablets: clear stale work");
+        }
+
+        // Snapshot the node list: _topo_sm._topology is replaced whenever group0 state is
+        // applied, so iterating it across a co_await hands out ids from a rebuilt container.
+        std::vector<raft::server_id> scan_nodes;
+        std::vector<raft::server_id> excluded_nodes;
+        for (const auto& [node_id, _] : _topo_sm._topology.normal_nodes) {
+            if (is_excluded(node_id)) {
+                excluded_nodes.push_back(node_id);
+                continue;
+            }
+            scan_nodes.push_back(node_id);
+        }
+        if (!excluded_nodes.empty()) {
+            // Their upload directories cannot be read, so whatever they hold would be left out of
+            // a request that then reports success and tells them to delete what they consumed.
+            // Nothing has been consumed yet, so failing here costs nothing; once the node is back
+            // or its removal has finished, the request can simply be re-run.
+            co_return co_await fail(co_await start_operation(), fmt::format(
+                    "Nodes {} are excluded from tablet operations (down and ignored), so their upload "
+                    "directories cannot be read; bring them back or finish removing them, then re-run the upload",
+                    fmt::join(excluded_nodes, ", ")));
+        }
+
+        // Scanned in parallel, bounded so a big cluster does not open one RPC per node at once.
+        // Mutating per_node is safe: nothing suspends between the reply arriving and the insert.
+        constexpr size_t max_concurrent_scans = 16;
+        // A backstop against a node that never answers, not a latency target; scans take minutes.
+        constexpr auto prepare_upload_timeout = std::chrono::minutes(30);
+        std::unordered_map<locator::host_id, prepare_upload_response> per_node;
+        sstring scan_error;
+        co_await max_concurrent_for_each(scan_nodes, max_concurrent_scans, [&] (raft::server_id node_id) -> future<> {
+            auto host = locator::host_id(node_id.uuid());
+            std::exception_ptr ex;
+            try {
+                auto resp = co_await ser::sstables_loader_rpc_verbs::send_prepare_upload(
+                        &_messaging, host,
+                        netw::messaging_service::clock_type::now() + prepare_upload_timeout,
+                        node_id, table);
+                rtlogger.info("upload_tablets: node {} has {} sstables, {} work items, {} bytes",
+                        host, resp.sstable_count, resp.items.size(), resp.total_estimated_bytes);
+                if (!resp.items.empty()) {
+                    per_node.emplace(host, std::move(resp));
+                }
+            } catch (...) {
+                ex = std::current_exception();
+            }
+            if (ex && scan_error.empty()) {
+                // The rest of the scan finishes so no RPC is in flight when the request fails.
+                scan_error = format("Failed to read upload directory of {}: {}", host, ex);
+            }
+        });
+        if (!scan_error.empty()) {
+            co_return co_await fail(co_await start_operation(), std::move(scan_error));
+        }
+
+        if (per_node.empty()) {
+            rtlogger.info("upload_tablets: nothing to upload for table {}", table);
+            auto g = co_await start_operation();
+            utils::chunked_vector<canonical_mutation> updates;
+            updates.emplace_back(
+                    topology_mutation_builder(g.write_timestamp())
+                        .del_global_topology_request()
+                        .del_global_topology_request_id()
+                        .drop_first_global_topology_request_id(_topo_sm._topology.global_requests_queue, req_id)
+                        .build());
+            updates.emplace_back(topology_request_tracking_mutation_builder(req_id).done().build());
+            co_await update_topology_state(std::move(g), std::move(updates), "upload_tablets: nothing to do");
+            co_return;
+        }
+
+        // Rows are tens of bytes, so a few thousand per command stays well under the size cap.
+        constexpr size_t rows_per_command = 4096;
+        size_t total_rows = 0;
+        uint64_t total_bytes = 0;
+
+        // Rows become a mutation only inside flush(), once the guard for the command carrying
+        // them exists: group0 requires that guard's write_timestamp(). Below it the clear
+        // tombstone swallows these rows; above it the tombstones retiring work no longer delete.
+        std::vector<upload_work_row> batch;
+        batch.reserve(rows_per_command);
+        auto flush = [&] () -> future<> {
+            if (batch.empty()) {
+                co_return;
+            }
+            auto g = co_await start_operation();
+            upload_work_mutation_builder builder(g.write_timestamp(), req_id);
+            for (const auto& row : batch) {
+                builder.set_work(row);
+            }
+            batch.clear();
+            utils::chunked_vector<canonical_mutation> updates;
+            updates.emplace_back(canonical_mutation(builder.build()));
+            co_await update_topology_state(std::move(g), std::move(updates), "upload_tablets: record work");
+        };
+
+        for (const auto& [host, resp] : per_node) {
+            for (const auto& item : resp.items) {
+                batch.push_back(upload_work_row{
+                    .tablet_id = item.tablet_id,
+                    .host = host,
+                    .shards = item.shards | std::views::transform([] (uint32_t s) { return shard_id(s); })
+                            | std::ranges::to<utils::small_vector<shard_id, 4>>(),
+                    .shard_bytes = item.shard_bytes
+                            | std::ranges::to<utils::small_vector<uint64_t, 4>>(),
+                    .estimated_bytes = item.estimated_bytes,
+                });
+                total_rows++;
+                total_bytes += item.estimated_bytes;
+                if (batch.size() >= rows_per_command) {
+                    co_await flush();
+                }
+            }
+        }
+        co_await flush();
+
+        // Read under the guard that commits the start, not before taking it: group0 then turns
+        // a racing abort into a concurrent modification, not a live already-decided request.
+        auto g = co_await start_operation();
+        if (auto error = co_await aborted(); !error.empty()) {
+            co_return co_await fail(std::move(g), std::move(error));
+        }
+
+        utils::chunked_vector<canonical_mutation> updates;
+        updates.emplace_back(
+                topology_mutation_builder(g.write_timestamp())
+                    .del_global_topology_request()
+                    .del_global_topology_request_id()
+                    .drop_first_global_topology_request_id(_topo_sm._topology.global_requests_queue, req_id)
+                    .start_upload_request(req_id)
+                    .build());
+        rtlogger.info("upload_tablets: request {} for table {} prepared, {} work items, {} bytes",
+                req_id, table, total_rows, total_bytes);
+        co_await update_topology_state(std::move(g), std::move(updates), "upload_tablets: start request");
     }
 
     // Preconditions:
@@ -1668,6 +1897,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         background_action_holder repair;
         background_action_holder repair_update_compaction_ctrl;
         background_action_holder restore;
+        background_action_holder upload;
         std::unordered_map<locator::tablet_transition_stage, background_action_holder> barriers;
         // Record the repair_time returned by the repair_tablet rpc call
         db_clock::time_point repair_time;
