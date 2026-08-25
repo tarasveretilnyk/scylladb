@@ -197,6 +197,10 @@ public:
     // rolling upgrade.
     gms::feature small_table_optimization_size_probe { *this, "SMALL_TABLE_OPTIMIZATION_SIZE_PROBE"sv };
     gms::feature alternator_composite_gsi_keys { *this, "ALTERNATOR_COMPOSITE_GSI_KEYS"sv };
+    // Gates cluster-wide upload. Must gate the whole window in which upload transitions can
+    // exist, not just submission: kinds/stages and the request name are parsed with .at() on
+    // every metadata load, so an old node throws on such a row and downgrade is blocked too.
+    gms::feature tablet_upload { *this, "TABLET_UPLOAD"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;
