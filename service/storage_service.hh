@@ -991,8 +991,21 @@ public:
     future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> restore_tablets(table_id, sstring snap_name);
     future<> abort_restore_tablets(table_id);
+
+    // Cluster-wide load-and-stream, satisfied by the tablet scheduler through per-tablet
+    // transitions, so unlike load_new_sstables() it neither pins the effective_replication_map
+    // nor blocks tablet migrations. target_tablet_count has to be supplied, not derived:
+    // sizing needs the upload volume, and the scan that learns it needs the tablet count.
+    // on_request_id is called once, on the calling shard, with the id of the request waited on.
+    future<> upload_tablets(table_id, bool primary_replica_only,
+            std::optional<size_t> target_tablet_count,
+            seastar::noncopyable_function<future<>(utils::UUID)> on_request_id = {});
+
+    future<bool> has_upload_request_for(table_id table);
     // Shard 0 only. Whether the request is in ongoing_upload_requests as of the applied group0 state.
     bool is_upload_request_ongoing(utils::UUID request_id) const;
+
+    future<> abort_upload_tablets(table_id);
     future<> set_tablet_balancing_enabled(bool);
 
     future<utils::UUID> submit_quiesce_topology_request();

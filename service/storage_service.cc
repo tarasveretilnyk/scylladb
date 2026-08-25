@@ -6179,6 +6179,165 @@ future<> storage_service::restore_tablets(table_id table, sstring snap_name) {
     slogger.info("Restoring {} finished", table);
 }
 
+future<bool> storage_service::has_upload_request_for(table_id table) {
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [table] (auto& ss) {
+            return ss.has_upload_request_for(table);
+        });
+    }
+    // Snapshot the ids: get_topology_request_entry() yields, and the topology sets must not be
+    // iterated across that. A stale answer is fine - the check is advisory.
+    std::vector<utils::UUID> reqs;
+    reqs.insert(reqs.end(), _topology_state_machine._topology.global_requests_queue.begin(),
+            _topology_state_machine._topology.global_requests_queue.end());
+    reqs.insert(reqs.end(), _topology_state_machine._topology.ongoing_upload_requests.begin(),
+            _topology_state_machine._topology.ongoing_upload_requests.end());
+    for (auto req : reqs) {
+        auto entry = co_await _sys_ks.local().get_topology_request_entry(req);
+        if (entry.upload_table_id == table) {
+            co_return true;
+        }
+    }
+    co_return false;
+}
+
+future<> storage_service::upload_tablets(table_id table, bool primary_replica_only,
+        std::optional<size_t> target_tablet_count,
+        seastar::noncopyable_function<future<>(utils::UUID)> on_request_id) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // on_request_id is hopped back to the caller's shard: it writes state the caller then
+        // reads locally, so running it here would race a cross-shard write against that read.
+        auto caller_shard = this_shard_id();
+        co_return co_await container().invoke_on(0, [&, caller_shard] (auto& ss) {
+            return ss.upload_tablets(table, primary_replica_only, target_tablet_count,
+                    [&on_request_id, caller_shard] (utils::UUID id) -> future<> {
+                        co_await smp::submit_to(caller_shard, [&on_request_id, id] () -> future<> {
+                            if (on_request_id) {
+                                co_await on_request_id(id);
+                            }
+                        });
+                    });
+        });
+    }
+
+    // Checked before anything reaches group0: older nodes parse upload transition kinds with
+    // .at() on the tablet read path, so a single persisted row would throw there.
+    if (!_feature_service.tablet_upload) {
+        throw std::runtime_error("Cannot upload cluster-wide. Feature 'TABLET_UPLOAD' is not available in cluster");
+    }
+    // Upload transitions are written to the request table's own system.tablets partition, and
+    // a co-located table has none: its map is the base table's. Such a request could never run.
+    {
+        const auto& tablets = get_token_metadata().tablets();
+        if (tablets.has_tablet_map(table) && !tablets.is_base_table(table)) {
+            throw std::invalid_argument(format("Table {} is co-located with {}; cluster upload supports "
+                    "base tables only", table, tablets.get_base_table(table)));
+        }
+    }
+
+    utils::UUID request_id;
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        std::optional<utils::UUID> ongoing;
+        // A request stays listed until the scheduler retires it, so an aborted one looks joinable.
+        sstring ongoing_error;
+
+        // Queued requests count too, or two submissions for the same table both consume the
+        // upload directories, ingesting every sstable twice - wrong for counters.
+        for (auto req : _topology_state_machine._topology.global_requests_queue) {
+            auto entry = co_await _sys_ks.local().get_topology_request_entry(req);
+            auto* type = std::get_if<global_topology_request>(&entry.request_type);
+            if (!type || *type != global_topology_request::upload_tablets) {
+                continue;
+            }
+            if (entry.upload_table_id == table) {
+                // Joining silently would run the upload with the other caller's mode.
+                if (entry.upload_primary_replica_only != primary_replica_only) {
+                    throw std::runtime_error(fmt::format("Table {} is already queued for upload with "
+                            "primary_replica_only={}", table, entry.upload_primary_replica_only));
+                }
+                if (target_tablet_count) {
+                    // A second --tablets caller would pin the table under the first's load and
+                    // leave it pinned, so reject rather than join. Plain callers still join.
+                    throw std::invalid_argument(fmt::format("Table {} already has an upload in progress; "
+                            "--tablets can only be used by the invocation that starts it", table));
+                }
+                ongoing = req;
+                ongoing_error = entry.error;
+                break;
+            }
+        }
+        for (auto req : _topology_state_machine._topology.ongoing_upload_requests) {
+            if (ongoing) {
+                break;
+            }
+            auto entry = co_await _sys_ks.local().get_topology_request_entry(req);
+            if (entry.upload_table_id == table) {
+                if (entry.upload_primary_replica_only != primary_replica_only) {
+                    throw std::runtime_error(fmt::format("Table {} is already being uploaded with "
+                            "primary_replica_only={}", table, entry.upload_primary_replica_only));
+                }
+                if (target_tablet_count) {
+                    throw std::invalid_argument(fmt::format("Table {} already has an upload in progress; "
+                            "--tablets can only be used by the invocation that starts it", table));
+                }
+                ongoing = req;
+                ongoing_error = entry.error;
+                break;
+            }
+        }
+        if (ongoing && !ongoing_error.empty()) {
+            // Joining a decided request skips the directory scan, missing what is there now.
+            release_guard(std::move(guard));
+            slogger.info("Upload for {} is finishing ({}); waiting for it before starting a new one",
+                    table, ongoing_error);
+            co_await wait_for_topology_request_completion(*ongoing);
+            continue;
+        }
+        if (ongoing) {
+            release_guard(std::move(guard));
+            request_id = *ongoing;
+            slogger.info("Upload for {} already in flight, waiting for it", table);
+            break;
+        }
+
+        request_id = guard.new_group0_state_id();
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        topology_request_tracking_mutation_builder trbuilder(request_id, _feature_service.topology_requests_type_column);
+
+        trbuilder.set_upload_tablets_data(table, primary_replica_only)
+                 .set("done", false)
+                 .set("start_time", db_clock::now());
+
+        builder.queue_global_topology_request_id(request_id);
+        trbuilder.set("request_type", global_topology_request::upload_tablets);
+
+        topology_change change{{builder.build(), trbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, "Upload tablets");
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            break;
+        } catch (group0_concurrent_modification&) {
+            slogger.debug("upload_tablets: concurrent modification, retrying");
+        }
+    }
+
+    if (on_request_id) {
+        co_await on_request_id(request_id);
+    }
+
+    auto error = co_await wait_for_topology_request_completion(request_id);
+    if (!error.empty()) {
+        throw std::runtime_error(error);
+    }
+
+    slogger.info("Uploading {} finished", table);
+}
+
 future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables() {
     auto holder = _async_gate.hold();
 
