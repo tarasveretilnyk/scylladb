@@ -968,6 +968,11 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
             return make_ready_future<upload_stream_session_result>();
         });
     });
+    ser::sstables_loader_rpc_verbs::register_upload_replicate_tablet(&_messaging, [this] (raft::server_id dst_id, locator::global_tablet_id gid, uint32_t dst_shard) -> future<upload_replicate_result> {
+        return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), gid, dst_shard] (auto&) {
+            return sl.local().do_upload_replicate_tablet(gid, dst_shard);
+        });
+    });
     ser::sstables_loader_rpc_verbs::register_upload_tablet(&_messaging, [this] (raft::server_id dst_id, locator::global_tablet_id gid, std::vector<uint32_t> source_shards) -> future<upload_tablet_result> {
         return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), gid, source_shards = std::move(source_shards)] (auto&) mutable {
             return sl.local().do_upload_tablet(gid, std::move(source_shards));
@@ -1401,6 +1406,55 @@ future<size_t> sstables_loader::combine_local_upload_sstables(locator::global_ta
     }
     partially_contained.clear();
     co_return taken;
+}
+
+future<upload_replicate_result> sstables_loader::do_upload_replicate_tablet(locator::global_tablet_id gid, shard_id dst_shard) {
+    co_await coroutine::switch_to(_sched_group);
+
+    // Named by the coordinator from this node's replica entry, so it has to exist here.
+    if (dst_shard >= this_smp_shard_count()) {
+        throw std::runtime_error(fmt::format("Upload replication of tablet {} targets shard {}, "
+                "but this node has {} shards", gid, dst_shard, this_smp_shard_count()));
+    }
+    co_await _ss.local().do_tablet_operation(gid, "UploadReplicate", [this, gid, dst_shard] (locator::tablet_metadata_guard& guard) -> future<service::tablet_operation_result> {
+        service::session_id session_id;
+        locator::host_id primary;
+        dht::token_range tablet_range;
+        {
+            auto& tmap = guard.get_tablet_map();
+            auto* trinfo = tmap.get_tablet_transition_info(gid.tablet);
+            if (!trinfo) {
+                throw std::runtime_error(fmt::format("No transition info for tablet {}", gid));
+            }
+            if (trinfo->stage != locator::tablet_transition_stage::upload_replicate) {
+                throw std::runtime_error(fmt::format("Tablet {} stage is not at upload_replicate", gid));
+            }
+            if (!trinfo->session_id) {
+                throw std::runtime_error(fmt::format("Upload replication of tablet {} was aborted", gid));
+            }
+            if (!trinfo->upload_info) {
+                throw std::runtime_error(fmt::format("Upload replicate transition of tablet {} has no endpoints", gid));
+            }
+            session_id = trinfo->session_id;
+            primary = trinfo->upload_info->primary_host;
+            tablet_range = tmap.get_token_range(gid.tablet);
+        }
+
+        service::session_topology_guard session_guard(session_id);
+        auto& tbl = _db.local().find_column_family(gid.table);
+        auto stream_guard = tbl.stream_in_progress();
+        auto ops_id = streaming::file_stream_id::create_random_id();
+        auto self = _ss.local().get_token_metadata().get_topology().my_host_id();
+
+        llog.debug("upload_replicate[{}] streaming tablet {} range {} from {} to {}:{}",
+                ops_id, gid, tablet_range, primary, self, dst_shard);
+        auto resp = co_await streaming::tablet_stream_files(ops_id, tbl, tablet_range, primary, self,
+                dst_shard, _messaging, session_guard.abort_source(),
+                service::frozen_topology_guard(session_id.uuid()));
+        llog.debug("upload_replicate[{}] tablet {} replicated, {} bytes", ops_id, gid, resp.stream_bytes);
+        co_return service::tablet_operation_empty_result{};
+    });
+    co_return upload_replicate_result{};
 }
 
 future<upload_tablet_result> sstables_loader::do_upload_tablet(locator::global_tablet_id gid,
