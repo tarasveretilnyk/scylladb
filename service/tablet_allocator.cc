@@ -682,6 +682,14 @@ class load_balancer {
         // Number of tablets which are streamed to this shard.
         size_t streaming_write_load = 0;
 
+        // Cluster upload is admitted by its own per-shard byte budget. Kept apart so an upload
+        // cannot exhaust the migration budget, counted so the upload scheduler can see the load.
+        size_t upload_read_load = 0;
+        size_t upload_write_load = 0;
+
+        size_t total_read_load() const { return streaming_read_load + upload_read_load; }
+        size_t total_write_load() const { return streaming_write_load + upload_write_load; }
+
         // Tablets which still have a replica on this shard which are candidates for migrating away from this shard.
         // Grouped by table. Used when _use_table_aware_balancing == true.
         // The set of candidates per table may be empty.
@@ -1021,11 +1029,17 @@ private:
             case tablet_transition_stage::repair:
                 return true;
             case tablet_transition_stage::restore:
+                // FIXME: restore transitions do stream, so returning false here hides
+                // their load from consider_scheduled_load() and lets the balancer
+                // schedule migrations on top of an in-flight restore. Tracked separately
+                // from the upload work below, which must not repeat the mistake: the
+                // upload scheduler limits itself against this very accounting, so
+                // under-reporting would make its own limits ineffective.
                 return false;
             case tablet_transition_stage::upload:
-                return false;
+                return true;
             case tablet_transition_stage::upload_replicate:
-                return false;
+                return true;
             case tablet_transition_stage::end_repair:
                 return false;
             case tablet_transition_stage::write_both_read_new:
@@ -2999,12 +3013,14 @@ public:
     void apply_load(node_load_map& nodes, const tablet_migration_streaming_info& info) {
         for (auto&& replica : info.read_from) {
             if (nodes.contains(replica.host)) {
-                nodes[replica.host].shards[replica.shard].streaming_read_load += info.stream_weight;
+                auto& sl = nodes[replica.host].shards[replica.shard];
+                (info.is_upload ? sl.upload_read_load : sl.streaming_read_load) += info.stream_weight;
             }
         }
         for (auto&& replica : info.written_to) {
             if (nodes.contains(replica.host)) {
-                nodes[replica.host].shards[replica.shard].streaming_write_load += info.stream_weight;
+                auto& sl = nodes[replica.host].shards[replica.shard];
+                (info.is_upload ? sl.upload_write_load : sl.streaming_write_load) += info.stream_weight;
             }
         }
     }
@@ -3015,6 +3031,9 @@ public:
         }
     }
 
+    // Deliberately blind to cluster upload, which is admitted by a byte budget of its own: an
+    // upload at its configured concurrency sits far above these count limits, so checking it here
+    // would stop tablets migrating to any shard taking part in a load.
     bool can_accept_load(node_load_map& nodes, const tablet_migration_streaming_info& info) {
         for (auto r : info.read_from) {
             if (!nodes.contains(r.host)) {
@@ -4355,15 +4374,21 @@ public:
         for (auto&& [host, load] : nodes) {
             size_t read = 0;
             size_t write = 0;
+            size_t upload_read = 0;
+            size_t upload_write = 0;
             for (auto& shard_load : load.shards) {
                 read += shard_load.streaming_read_load;
                 write += shard_load.streaming_write_load;
+                upload_read += shard_load.upload_read_load;
+                upload_write += shard_load.upload_write_load;
             }
-            auto level = !only_active_ || (read + write) > 0 ? seastar::log_level::info : seastar::log_level::debug;
+            auto level = !only_active_ || (read + write + upload_read + upload_write) > 0
+                    ? seastar::log_level::info : seastar::log_level::debug;
             lblogger.log(level, "Node {}: {}/{} load={:.6f} tablets={} shards={} tablets/shard={:.3f} state={} cap={}"
-                                " rd={} wr={}",
+                                " rd={} wr={} up_rd={} up_wr={}",
                          host, load.dc(), load.rack(), load.avg_load, load.tablet_count, load.shard_count,
-                         load.tablets_per_shard(), load.state(), load.dusage->capacity, read, write);
+                         load.tablets_per_shard(), load.state(), load.dusage->capacity, read, write,
+                         upload_read, upload_write);
         }
     }
 
