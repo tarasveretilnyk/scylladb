@@ -752,3 +752,226 @@ async def test_cluster_upload_abort(manager: ScyllaClusterManager):
         await wait_for_upload_dirs_empty(saved)
 
 
+async def view_row_count(cql, ks, view):
+    rows = await cql.run_async(f"SELECT COUNT(*) AS c FROM {ks}.{view}")
+    return rows[0].c
+
+
+async def three_rack_servers(manager):
+    """RF=3 requires three racks, since a replica set must span them."""
+    return await manager.servers_add(3, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r3"},
+    ])
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_replicates_to_all_replicas(manager: ScyllaClusterManager):
+    """At RF>1 the data must end up on every replica, not just the primary.
+
+    Phase 1 streams into one replica only - the primary the scheduler assigned - and phase 2
+    file-streams it from there to the rest. Every other test in this file runs at RF=1,
+    where the primary is the only replica and phase 2 never runs, so this is the first test
+    that exercises it at all.
+
+    Reading at ALL does NOT prove this on its own: the consistency level controls how many
+    replicas must respond, not that each holds the data, so a read would still return every
+    row if only the primary had it. The proof is instead taken two ways - the coordinator log
+    must show replicate transitions being driven, and every tablet must have left the
+    replicating phase.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # Watch the coordinator log so replication is shown, not inferred from a successful read.
+        coord_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await coord_log.mark()
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180)
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}
+
+        replicated = await coord_log.grep("Replicating uploaded tablet", from_mark=log_mark)
+        assert replicated, ("no replicate transition was driven, so phase 2 never ran and the "
+                            "data may be on primaries only")
+
+        leftover = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
+        assert not leftover, f"{len(leftover)} tablets still have upload state after completion"
+
+        await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_retries_failed_replication(manager: ManagerClient):
+    """A failed phase-2 replication must be retried until the data reaches every replica.
+
+    Phase 2 failing clears the transition but leaves the tablet in the replicating phase, so
+    the scheduler picks it up again after its backoff. That retry had never run: the backoff
+    it depends on lived on the load balancer, which is rebuilt for every scheduling pass, so
+    the state was always empty and nothing was ever held back or resumed. Nothing in the
+    system provokes a phase-2 failure on its own either, hence the injection.
+
+    A read at ALL would not show this - the consistency level says how many replicas must
+    answer, not that each holds the data - so the proof is that every tablet leaves the
+    replicating phase, which only happens once its replication has actually succeeded.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # One shot per node: each fails its first replication and then lets the rest through,
+        # so the load has to recover rather than being blocked outright.
+        injection = "upload_replicate_fail"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=True)
+
+        logs = [await manager.server_open_log(s.server_id) for s in servers]
+        marks = [await lg.mark() for lg in logs]
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=240)
+
+        # The failure has to have actually happened, or the retry was never exercised.
+        failed = []
+        for lg, mk in zip(logs, marks):
+            failed += await lg.grep("Injected upload_replicate failure", from_mark=mk)
+        assert failed, "the injection never fired; the retry path was not exercised"
+
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+
+        # Every tablet left the replicating phase, so each retried replication completed. Had
+        # the retry not run, the request could not have finished at all - which is the other
+        # half of the assertion, since the wait above returned.
+        leftover = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
+        assert not leftover, f"{len(leftover)} tablets still replicating after completion"
+
+        await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_primary_replica_only(manager: ScyllaClusterManager):
+    """--primary-replica-only stops after phase 1.
+
+    The data must land, but replication must not happen - that is the whole point of the
+    mode, and it is the negation of the previous test.
+
+    Consistency level cannot express that. A read at ONE picks one replica and would find
+    nothing whenever it picks a replica that never received the data; a read at ALL merges
+    across replicas and returns every row as long as any one of them has it. So the mode is
+    verified by reading at ALL for the data and by checking the coordinator log for the
+    absence of replicate transitions.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        coord_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await coord_log.mark()
+
+        # Must be accepted now that phase 2 exists; it used to be rejected outright.
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf,
+                                                  primary_replica_only=True, timeout=180)
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}
+
+        replicated = await coord_log.grep("Replicating uploaded tablet", from_mark=log_mark)
+        assert not replicated, ("phase 2 ran even though primary_replica_only was requested, so "
+                                "the data was replicated when it should not have been")
+
+        leftover = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
+        assert not leftover, "request finished with upload state left behind"
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_builds_views(manager: ScyllaClusterManager):
+    """Views must be populated on every replica after an upload.
+
+    This is the path I had reasoned about wrongly: view updates are generated per base
+    replica for its paired view replica, so an sstable that arrives by file streaming has to
+    carry staging state or the replicas that never streamed would never populate their view
+    replicas. Both new transport paths - local attach and remote file streaming - decide
+    that state themselves, so this covers both.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text, value int, primary key (pk))")
+        await cql.run_async(f"CREATE MATERIALIZED VIEW {ks}.mv AS SELECT * FROM {ks}.{cf} "
+                            f"WHERE value IS NOT NULL AND pk IS NOT NULL PRIMARY KEY (value, pk)")
+        await populate(cql, ks, cf)
+
+        async def view_ready():
+            return True if await view_row_count(cql, ks, 'mv') == KEYS else None
+        await wait_for(view_ready, time.time() + 60, period=0.5)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+
+        async def view_empty():
+            return True if await view_row_count(cql, ks, 'mv') == 0 else None
+        await wait_for(view_empty, time.time() + 60, period=0.5)
+
+        await plant_upload_dirs(saved)
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=120)
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}
+
+        async def view_rebuilt():
+            n = await view_row_count(cql, ks, 'mv')
+            return True if n == KEYS else None
+        try:
+            await wait_for(view_rebuilt, time.time() + 90, period=1)
+        except Exception:
+            n = await view_row_count(cql, ks, 'mv')
+            raise AssertionError(f"view has {n} rows, expected {KEYS}: uploaded sstables did not "
+                                 f"generate view updates on all replicas")
+
+
