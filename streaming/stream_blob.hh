@@ -23,6 +23,8 @@
 #include "locator/host_id.hh"
 #include "service/topology_guard.hh"
 #include "sstables/open_info.hh"
+#include "sstables/shared_sstable.hh"
+#include "reader_permit.hh"
 
 #include <fmt/core.h>
 #include <fmt/ostream.h>
@@ -202,14 +204,25 @@ future<stream_files_response> clone_sstable_handler(replica::database& db, db::v
 // Ask the src node to stream sstables to dst node for table in the given token range using TABLET_STREAM_FILES verb.
 future<stream_files_response> tablet_stream_files(const file_stream_id& ops_id, replica::table& table, const dht::token_range& range, const locator::host_id& src, const locator::host_id& dst, seastar::shard_id dst_shard_id, netw::messaging_service& ms, abort_source& as, service::frozen_topology_guard topo_guard);
 
+// Builds per-component stream items for an explicit sstable set: cluster upload's sstables are
+// still in the upload directory, and target_state is where they land, not their state here.
+future<std::list<stream_blob_info>> make_sstable_stream_infos(replica::table& table,
+        std::vector<sstables::shared_sstable> ssts,
+        file_stream_id ops_id,
+        reader_permit permit,
+        sstables::sstable_state target_state);
+
 // Exposed for testability
+// as, when given, is checked before each file and between chunks: cluster upload cannot put a
+// topology guard on the wire (the receiver would reject it), so aborts act on the sending side.
 future<size_t> tablet_stream_files(netw::messaging_service& ms,
     std::list<stream_blob_info> sources,
     std::vector<node_and_shard> targets,
     table_id table,
     file_stream_id ops_id,
     service::frozen_topology_guard topo_guard,
-    bool may_inject_errors = false
+    bool may_inject_errors = false,
+    seastar::abort_source* as = nullptr
     );
 
 

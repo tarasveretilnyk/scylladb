@@ -491,10 +491,13 @@ future<> stream_blob_handler(replica::database& db, db::view::view_building_work
 
                     auto sst = co_await sstable_sink->close();
                     if (sst) {
-                        blogger.debug("stream_sstables[{}] Loading sstable {} on shard {}", meta.ops_id, sst->toc_filename(), meta.dst_shard_id);
+                        blogger.debug("stream_sstables[{}] Loading sstable {} on shard {}", meta.ops_id,
+                                sst->toc_filename(), meta.dst_shard_id);
                         auto desc = sst->get_descriptor(sstables::component_type::TOC);
                         sst = {};
-                        co_await load_sstable_for_tablet(meta.ops_id, db, vbw, meta.table, sstable_state(meta), std::move(desc), meta.dst_shard_id);
+                        // Attached on the sender-named shard, not the one the connection landed on.
+                        co_await load_sstable_for_tablet(meta.ops_id, db, vbw, meta.table, sstable_state(meta),
+                                std::move(desc), meta.dst_shard_id);
                     }
                 },
                 std::move(out)
@@ -552,7 +555,8 @@ namespace streaming {
 // Returns number of bytes sent over network
 future<size_t>
 tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sources, std::vector<node_and_shard> targets,
-        table_id table, file_stream_id ops_id, service::frozen_topology_guard topo_guard, bool inject_errors) {
+        table_id table, file_stream_id ops_id, service::frozen_topology_guard topo_guard, bool inject_errors,
+        seastar::abort_source* as) {
     size_t ops_total_size = 0;
     if (targets.empty()) {
         co_return ops_total_size;
@@ -585,6 +589,10 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
     stream_options.read_ahead = file_stream_read_ahead;
 
     for (auto&& source_info : sources) {
+        // Checked here as well as between chunks, so an abort during a file open is not delayed.
+        if (as) {
+            as->check();
+        }
         // Keep stream_blob_info alive only at duration of streaming. Allowing the file descriptor
         // of the sstable component to be released right after it has been streamed.
         auto info = std::exchange(source_info, {});
@@ -620,6 +628,9 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
             auto send_data_to_peer = [&] () mutable -> future<> {
                 try {
                     while (!got_error_from_peer) {
+                        if (as) {
+                            as->check();
+                        }
                         may_inject_error(meta, inject_errors, "read_data");
                         auto buf = co_await fstream->read_up_to(file_stream_buffer_size);
                         if (buf.size() == 0) {
@@ -781,6 +792,52 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
     co_return ops_total_size;
 }
 
+
+future<std::list<stream_blob_info>> make_sstable_stream_infos(replica::table& table,
+        std::vector<sstables::shared_sstable> ssts,
+        file_stream_id ops_id,
+        reader_permit permit,
+        sstables::sstable_state target_state) {
+    std::list<stream_blob_info> files;
+    auto& sst_gen = table.get_sstable_generation_generator();
+
+    for (auto& sst : ssts) {
+        auto sst_id = sst->sstable_identifier();
+        if (!sst_id) {
+            on_internal_error(blogger, format("sstable {} has no identifier", sst->get_filename()));
+        }
+        sstables::sstable_files_snapshot snapshot {
+            .sst = sst,
+            .files = co_await sst->readable_file_for_all_components(),
+        };
+        auto sources = co_await sstables::create_stream_sources(snapshot, permit);
+        // What the receiver parses back out of the filename. Not the source generation: upload
+        // directories accept legacy numeric ones, for which as_uuid() reports an internal error.
+        auto newgen = sst_gen();
+        auto newgen_name = fmt::to_string(newgen);
+
+        size_t added = 0;
+        for (auto&& src : sources) {
+            auto oldname = src->component_basename();
+            auto newname = get_sstable_name_with_generation(ops_id, oldname, newgen_name);
+            auto& info = files.emplace_back();
+            info.fops = file_ops::stream_sstables;
+            info.sstable_meta = stream_sstable_meta{*sst_id, newgen.as_uuid(),
+                    static_cast<int32_t>(sst->get_version()), static_cast<int32_t>(sst->get_format()),
+                    target_state};
+            info.filename = std::move(newname);
+            info.source = [src = std::move(src)] (const file_input_stream_options& options) {
+                return src->input(options);
+            };
+            added++;
+        }
+        // The last component of each sstable is what tells the destination to load it.
+        if (added) {
+            files.back().fops = file_ops::load_sstables;
+        }
+    }
+    co_return files;
+}
 
 future<stream_files_response> tablet_stream_files_handler(replica::database& db, db::view::view_building_worker& vbw, netw::messaging_service& ms, streaming::stream_files_request req) {
     stream_files_response resp;
