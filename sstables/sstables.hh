@@ -362,6 +362,11 @@ public:
 
     future<uint64_t> estimated_keys_for_range(const dht::token_range& range);
 
+    // Estimates the bytes of this sstable's data component falling into range, in the same
+    // uncompressed space as data_size(). 0 means provably no data; any overlap yields at least 1.
+    // Exact-ish with a BTI index; with a Summary only as fine as the sampling interval.
+    future<uint64_t> estimated_data_size_for_range(const dht::token_range& range);
+
     // mark_for_deletion() specifies that a sstable isn't relevant to the
     // current shard, and thus can be deleted by the deletion manager, if
     // all shards sharing it agree. In case the sstable is unshared, it's
@@ -892,6 +897,9 @@ private:
 
     std::optional<std::pair<uint64_t, uint64_t>> get_sample_indexes_for_range(const dht::token_range& range);
     std::optional<std::pair<uint64_t, uint64_t>> get_index_pages_for_range(const dht::token_range& range);
+
+    // Size of range in the data file's uncompressed space, from the BTI index; needs Partitions.db.
+    future<uint64_t> bti_data_file_span_for_range(const dht::token_range& range);
 
     std::vector<unsigned> compute_shards_for_this_sstable(const dht::sharder&) const;
     template <typename Components>

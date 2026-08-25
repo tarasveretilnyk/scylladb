@@ -3844,6 +3844,47 @@ std::optional<std::pair<uint64_t, uint64_t>> sstable::get_index_pages_for_range(
     return std::nullopt;
 }
 
+future<uint64_t> sstable::bti_data_file_span_for_range(const dht::token_range& range) {
+    // This is an extra conditional for the special case when the given range
+    // doesn't overlap with the sstable's range at all.
+    //
+    // In this case, if the ranges are adjacent, the main code path could easily
+    // return a non-empty span,
+    // due to the inexactness of BTI indexes for range queries.
+    // Returning something non-zero in this case would be unfortunate,
+    // so the extra conditional makes sure that we return 0.
+    auto local_tr = dht::token_range::make({get_first_decorated_key().token()}, {get_last_decorated_key().token()});
+    if (!local_tr.overlaps(range, dht::token_comparator())) {
+        co_return 0;
+    }
+
+    uint64_t span;
+
+    auto& sem = _manager.sstable_metadata_concurrency_sem();
+    uint64_t estimated_memory = 16 * 1024; // Value pulled from thin air
+    reader_permit permit = co_await sem.obtain_permit(_schema, "sstable::bti_data_file_span_for_range", estimated_memory, db::no_timeout, {});
+    auto ir = make_index_reader(std::move(permit));
+
+    std::exception_ptr ex;
+    try {
+        co_await ir->advance_to(dht::to_partition_range(range));
+        auto data_file_range = ir->data_file_positions();
+        auto uncompressed_data_size = data_size();
+        auto start = data_file_range.start;
+        auto end = data_file_range.end.value_or(uncompressed_data_size);
+        sstlog.debug("bti_data_file_span_for_range(sst={}, range={}): data_start: {}, data_end: {}, data_size: {}",
+                get_filename(), range, start, end, uncompressed_data_size);
+        span = end - start;
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await ir->close();
+    if (ex) {
+        co_return coroutine::exception(std::move(ex));
+    }
+    co_return span;
+}
+
 future<uint64_t> sstable::estimated_keys_for_range(const dht::token_range& range) {
   if (_components->summary) {
     auto page_range = get_index_pages_for_range(range);
@@ -3857,53 +3898,34 @@ future<uint64_t> sstable::estimated_keys_for_range(const dht::token_range& range
     uint64_t estimated_keys = (uint128_t)range_pages * total_keys / total_pages;
     co_return std::max(uint64_t(1), estimated_keys);
   } else if (_partitions_db_footer) {
-    // This is an extra conditional for the special case when the given range
-    // doesn't overlap with the sstable's range at all.
-    //
-    // In this case, if the ranges are adjacent, the main code path could easily
-    // return "1 partition" instead of "0 partitions",
-    // due to the inexactness of BTI indexes for range queries.
-    // Returning something non-zero in this case would be unfortunate,
-    // so the extra conditional makes sure that we return 0.
-    auto local_tr = dht::token_range::make({get_first_decorated_key().token()}, {get_last_decorated_key().token()});
-    if (!local_tr.overlaps(range, dht::token_comparator())) {
+    auto span = co_await bti_data_file_span_for_range(range);
+    if (span == 0) {
         co_return 0;
     }
-
-    uint64_t result;
-
-    auto& sem = _manager.sstable_metadata_concurrency_sem();
-    uint64_t estimated_memory = 16 * 1024; // Value pulled from thin air
-    reader_permit permit = co_await sem.obtain_permit(_schema, "sstable::estimated_keys_for_range", estimated_memory, db::no_timeout, {});
-    auto ir = make_index_reader(std::move(permit));
-
-    std::exception_ptr ex;
-    try {
-        co_await ir->advance_to(dht::to_partition_range(range));
-        auto data_file_range = ir->data_file_positions();
-        auto uncompressed_data_size = data_size();
-        auto start = data_file_range.start;
-        auto end = data_file_range.end.value_or(uncompressed_data_size);
-        auto total_count = get_estimated_key_count();
-        sstlog.debug("estimated_keys_for_range(sst={}, range={}): data_start: {}, data_end: {}, data_size: {}, estimated_key_count: {}",
-                get_filename(), range, start, end, uncompressed_data_size, total_count);
-        if (start == end) {
-            result = 0;
-        } else {
-            result = std::ceil(double(end - start) / uncompressed_data_size * total_count);
-        }
-    } catch (...) {
-        ex = std::current_exception();
-    }
-    co_await ir->close();
-    if (ex) {
-        co_return coroutine::exception(std::move(ex));
-    } else {
-        co_return result;
-    }
+    co_return uint64_t(std::ceil(double(span) / data_size() * get_estimated_key_count()));
   } else {
     co_return coroutine::exception(std::make_exception_ptr(malformed_sstable_exception(
         format("{}: neither Summary.db nor Partitions.db component is present, can't estimate number of partitions in range", get_filename()))));
+  }
+}
+
+future<uint64_t> sstable::estimated_data_size_for_range(const dht::token_range& range) {
+  if (_components->summary) {
+    auto page_range = get_index_pages_for_range(range);
+    if (!page_range) {
+        co_return 0;
+    }
+    // Summary resolution is one index page, so apportion the data size by pages covered.
+    using uint128_t = unsigned __int128;
+    uint64_t range_pages = page_range->second - page_range->first;
+    auto total_pages = _components->summary.entries.size();
+    uint64_t estimated_size = (uint128_t)range_pages * data_size() / total_pages;
+    co_return std::max(uint64_t(1), estimated_size);
+  } else if (_partitions_db_footer) {
+    co_return co_await bti_data_file_span_for_range(range);
+  } else {
+    co_return coroutine::exception(std::make_exception_ptr(malformed_sstable_exception(
+        format("{}: neither Summary.db nor Partitions.db component is present, can't estimate data size in range", get_filename()))));
   }
 }
 
