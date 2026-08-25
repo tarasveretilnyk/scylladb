@@ -975,3 +975,193 @@ async def test_cluster_upload_builds_views(manager: ScyllaClusterManager):
                                  f"generate view updates on all replicas")
 
 
+async def multi_dc_servers(manager):
+    """Two DCs with asymmetric replication, to exercise cross-DC source selection."""
+    return await manager.servers_add(5, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r3"},
+        {"dc": "dc2", "rack": "r1"},
+        {"dc": "dc2", "rack": "r2"},
+    ])
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_multi_dc_asymmetric_rf(manager: ScyllaClusterManager):
+    """Five nodes, two DCs, RF 3 in one and 2 in the other.
+
+    Every node holds sstables for the whole ring, so most work items have a source in a
+    different rack or DC from the tablet's replicas. That is what exercises the locality
+    gradation and the cross-DC fallback: a source in dc2 for a tablet whose replicas are in
+    dc1 scores worse than a local one but must still be scheduled, or its share of the data
+    is never loaded.
+    """
+    servers = await multi_dc_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'dc1': 3, 'dc2': 2}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        coord_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await coord_log.mark()
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=150)
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}
+
+        # Work from all five directories has to have been consumed, not just the local ones.
+        await wait_for_upload_dirs_empty(saved, timeout=120)
+
+        assert await coord_log.grep("Replicating uploaded tablet", from_mark=log_mark), \
+            "no replication happened despite RF>1 in both datacenters"
+
+        leftover = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
+        assert not leftover, f"{len(leftover)} tablets left mid-phase"
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_uses_both_transport_paths(manager: ScyllaClusterManager):
+    """Both ingest paths must actually be taken.
+
+    A tablet whose primary is the node holding the sstables is attached in place, with no
+    transfer at all; any other tablet is sent as files. With several nodes each holding data
+    for the whole ring, both cases occur, and a green test that silently took only one of
+    them would hide a broken path - which is how the file-streaming path stayed broken
+    through several passing runs.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # The per-tablet executor lines this test greps for are debug level.
+        for s in servers:
+            await manager.api.set_logger_level(s.ip_addr, 'sstables_loader', 'debug')
+        logs = [await manager.server_open_log(s.server_id) for s in servers]
+        marks = [await lg.mark() for lg in logs]
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=150)
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}
+
+        local, streamed = 0, 0
+        for lg, mk in zip(logs, marks):
+            local += len(await lg.grep("Attached .* fully contained sstables locally", from_mark=mk))
+            streamed += len(await lg.grep(r"upload_file_stream\[.*\] tablet .* sent", from_mark=mk))
+
+        logger.info(f"local attaches: {local}, file streams completed: {streamed}")
+        assert local > 0, "no sstable was attached locally; the same-host path never ran"
+        assert streamed > 0, "no sstable was file-streamed; the remote path never ran"
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_combines_straddling_sstables_locally(manager: ScyllaClusterManager):
+    """An sstable that crosses a tablet boundary must not be sent over the wire to this node.
+
+    Only part of such an sstable belongs to the tablet, so unlike a fully contained one it
+    cannot simply be moved out of the upload directory. That used to mean handing it to the
+    ordinary streaming path with the target set to ourselves, which serialises every row,
+    sends it over a loopback RPC and deserialises it again to arrive where it started. It is
+    read-combined into a new sstable in place instead.
+
+    RF=1 on a single node makes this node the primary for every tablet, so no transfer is
+    ever warranted. The absence of the mutation path is what the test is really pinning - a
+    regression there would still load the data correctly and only show up as cost.
+    """
+    server = await manager.server_add()
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        # Flushing is tablet-aware, so the boundaries have to move underneath a file to straddle it.
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 2}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, [server], ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # The per-tablet executor lines this test greps for are debug level.
+        await manager.api.set_logger_level(server.ip_addr, 'sstables_loader', 'debug')
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+
+        await manager.api.tablets_upload_and_wait(server.ip_addr, ks, cf, tablet_count=32, timeout=150)
+
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+
+        straddling = await log.grep(r"partially contained sstables", from_mark=mark)
+        combined = await log.grep(r"Combined .* boundary-straddling", from_mark=mark)
+        looped = await log.grep(r"load_and_stream: started ops_uuid", from_mark=mark)
+
+        # Guards the premise: without a straddling sstable the assertions below prove nothing.
+        assert any(", 0 partially contained" not in line for line, _ in straddling), \
+            "no sstable straddled a tablet boundary; the test proves nothing"
+        assert combined, "a straddling sstable was not combined in place"
+        assert not looped, \
+            f"{len(looped)} mutation stream(s) were started although this node is the " \
+            f"primary for every tablet; the loopback path is back"
+
+        await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_reports_metrics(manager: ScyllaClusterManager):
+    """The scheduler's counters must move, since they are the only way to tell a slow upload
+    from a stalled one in the field."""
+    servers = await manager.servers_add(2)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180)
+
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        produced = metrics.get('scylla_load_balancer_uploads_produced')
+        assert produced is not None, "uploads_produced metric is missing"
+        assert produced > 0, f"uploads_produced did not move: {produced}"
+
+        remaining = metrics.get('scylla_load_balancer_upload_work_items_remaining')
+        assert remaining == 0, f"upload_work_items_remaining is {remaining} after completion"
+
+
+@pytest.mark.asyncio
