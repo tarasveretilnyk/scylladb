@@ -14,6 +14,8 @@
 #include "locator/abstract_replication_strategy.hh"
 #include "tablet_allocator_fwd.hh"
 #include "locator/token_metadata_fwd.hh"
+#include "db/system_keyspace.hh"
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/metrics.hh>
 
 namespace db {
@@ -102,6 +104,13 @@ struct load_balancer_cluster_stats {
     uint64_t auto_repair_enabled_nr = 0;
 
     uint64_t repairs_produced = 0;
+
+    // Cluster upload; bytes_remaining and transitions are gauges, the rest accumulate.
+    uint64_t uploads_produced = 0;
+    uint64_t uploads_skipped_load = 0;
+    uint64_t upload_bytes_remaining = 0;
+    uint64_t upload_work_items_remaining = 0;
+    uint64_t upload_transitions_in_flight = 0;
 };
 
 using dc_name = sstring;
@@ -212,6 +221,62 @@ struct tablet_rack_list_colocation_plan {
     }
 };
 
+// Whether balance_tablets() should plan cluster upload work. Callers that consume only the
+// resize plan pass no: planning uploads records attempts and backoffs even when the plan is
+// then discarded, so each discarded slice would read as a failed one.
+using plan_uploads = bool_class<class plan_uploads_tag>;
+
+struct upload_work_assignment {
+    locator::global_tablet_id tablet;
+    locator::host_id source_host;
+    utils::small_vector<shard_id, 4> source_shards;
+    // Where phase 1 puts the data; fixed for the request so phase 2 knows its source.
+    locator::host_id primary_host;
+    // The request this slice belongs to; carried so the coordinator need not look it up.
+    utils::UUID request_id;
+};
+
+struct upload_replicate_assignment {
+    locator::global_tablet_id tablet;
+    locator::host_id primary_host;
+    utils::UUID request_id;
+};
+
+struct upload_phase_change {
+    utils::UUID request_id;
+    uint64_t tablet_id = 0;
+    db::system_keyspace::upload_phase phase = db::system_keyspace::upload_phase::uploading;
+    // Set when the primary is being assigned for the first time.
+    std::optional<locator::host_id> assign_primary;
+};
+
+struct tablet_upload_plan {
+    std::vector<upload_work_assignment> _uploads;
+    std::vector<upload_replicate_assignment> _replicates;
+    std::vector<upload_phase_change> _phase_changes;
+
+    const std::vector<upload_work_assignment>& uploads() const { return _uploads; }
+    const std::vector<upload_replicate_assignment>& replicates() const { return _replicates; }
+    const std::vector<upload_phase_change>& phase_changes() const { return _phase_changes; }
+    size_t size() const { return _uploads.size() + _replicates.size() + _phase_changes.size(); }
+
+    void add(upload_work_assignment a) { _uploads.emplace_back(std::move(a)); }
+    void add(upload_replicate_assignment a) { _replicates.emplace_back(std::move(a)); }
+    void add(upload_phase_change c) { _phase_changes.emplace_back(std::move(c)); }
+
+    void merge(tablet_upload_plan&& other) {
+        std::move(other._uploads.begin(), other._uploads.end(), std::back_inserter(_uploads));
+        std::move(other._replicates.begin(), other._replicates.end(), std::back_inserter(_replicates));
+        std::move(other._phase_changes.begin(), other._phase_changes.end(), std::back_inserter(_phase_changes));
+    }
+};
+
+struct upload_completion_info {
+    utils::UUID request_id;
+    table_id table;
+    sstring error;
+};
+
 struct restore_completion_info {
     utils::UUID request_id;
     table_id table;
@@ -256,11 +321,21 @@ private:
     tablet_rack_list_colocation_plan _rack_list_colocation_plan;
     keyspace_rf_change_plan _rf_change_plan;
     std::vector<restore_completion_info> _restore_completions;
+    tablet_upload_plan _upload_plan;
+    std::vector<upload_completion_info> _upload_completions;
     bool _has_nodes_to_drain = false;
     std::vector<drain_failure> _drain_failures;
+    std::optional<seastar::lowres_clock::time_point> _retry_at;
 public:
     /// Returns true iff there are decommissioning nodes which own some tablet replicas.
     bool has_nodes_to_drain() const { return _has_nodes_to_drain; }
+
+    /// Work this pass held back until a deadline, not blocked on an event that will fire. An
+    /// empty plan carrying this is not an idle cluster: the coordinator has to come back by then.
+    std::optional<seastar::lowres_clock::time_point> retry_at() const { return _retry_at; }
+    void retry_no_later_than(seastar::lowres_clock::time_point when) {
+        _retry_at = _retry_at ? std::min(*_retry_at, when) : when;
+    }
     bool requires_schema_changes() const { return _rf_change_plan.size() > 0; }
 
     const migrations_vector& migrations() const { return _migrations; }
@@ -271,7 +346,9 @@ public:
                                + _rack_list_colocation_plan.size()
                                + _drain_failures.size()
                                + _rf_change_plan.size()
-                               + _restore_completions.size();
+                               + _restore_completions.size()
+                               + _upload_plan.size()
+                               + _upload_completions.size();
                         }
     size_t tablet_migration_count() const { return _migrations.size(); }
     size_t resize_decision_count() const { return _resize_plan.size(); }
@@ -298,6 +375,8 @@ public:
         std::move(other._migrations.begin(), other._migrations.end(), std::back_inserter(_migrations));
         std::move(other._drain_failures.begin(), other._drain_failures.end(), std::back_inserter(_drain_failures));
         std::move(other._restore_completions.begin(), other._restore_completions.end(), std::back_inserter(_restore_completions));
+        std::move(other._upload_completions.begin(), other._upload_completions.end(), std::back_inserter(_upload_completions));
+        _upload_plan.merge(std::move(other._upload_plan));
         _has_nodes_to_drain |= other._has_nodes_to_drain;
         _resize_plan.merge(std::move(other._resize_plan));
         _repair_plan.merge(std::move(other._repair_plan));
@@ -337,6 +416,18 @@ public:
 
     void add_restore_completion(restore_completion_info info) {
         _restore_completions.emplace_back(std::move(info));
+    }
+
+    const tablet_upload_plan& upload_plan() const { return _upload_plan; }
+
+    void set_upload_plan(tablet_upload_plan plan) {
+        _upload_plan = std::move(plan);
+    }
+
+    const std::vector<upload_completion_info>& upload_completions() const { return _upload_completions; }
+
+    void add_upload_completion(upload_completion_info info) {
+        _upload_completions.emplace_back(std::move(info));
     }
 
     void maybe_add_rack_list_request_to_resume(const utils::UUID& id) {
@@ -393,7 +484,7 @@ public:
     ///
     /// The algorithm takes care of limiting the streaming load on the system, also by taking active migrations into account.
     ///
-    future<migration_plan> balance_tablets(locator::token_metadata_ptr, service::topology*, db::system_keyspace*, locator::load_stats_ptr = {}, std::unordered_set<locator::host_id> = {});
+    future<migration_plan> balance_tablets(locator::token_metadata_ptr, service::topology*, db::system_keyspace*, locator::load_stats_ptr = {}, std::unordered_set<locator::host_id> = {}, plan_uploads = plan_uploads::yes);
 
     void set_load_stats(locator::load_stats_ptr);
 

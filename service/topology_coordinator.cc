@@ -1271,6 +1271,11 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         requires_schema_changes = plan.requires_schema_changes();
                     } else if (!tm->tablets().is_idle()) {
                         error = "tablet resize in progress";
+                    } else if (plan.retry_at() || !_topo_sm._topology.ongoing_upload_requests.empty()) {
+                        // An empty plan is not an idle cluster while an upload is ongoing: its
+                        // work may be held back until a deadline, or parked on a source that is
+                        // down, and either resumes without a topology event.
+                        error = "cluster upload in progress";
                     }
                 }
             } catch (...) {
@@ -1676,6 +1681,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
     // Set to true when any action started on behalf of a background_action_holder
     // for any tablet finishes, or fails and needs to be restarted.
+    // Caps how long the coordinator sits on a balancer deadline; real ones are seconds.
+    static constexpr auto max_deferred_work_wait = std::chrono::seconds(10);
+
     bool _tablets_ready = false;
 
     seastar::named_gate _async_gate;
@@ -2651,10 +2659,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
         bool has_nodes_to_drain = false;
         bool requires_schema_changes = false;
+        std::optional<lowres_clock::time_point> retry_at;
         if (!preempt) {
             auto plan = co_await _tablet_allocator.balance_tablets(get_token_metadata_ptr(), &_topo_sm._topology, &_sys_ks, {}, get_dead_nodes());
             has_nodes_to_drain = plan.has_nodes_to_drain();
             requires_schema_changes = plan.requires_schema_changes();
+            retry_at = plan.retry_at();
             if (!drain || plan.has_nodes_to_drain()) {
                 co_await generate_migration_updates(updates, guard, plan);
             }
@@ -2702,8 +2712,25 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 rtlogger.debug("Going to sleep with active tablet transitions");
                 log_active_transitions(5);
                 release_guard(std::move(guard));
-                co_await await_event();
+                if (!drain && retry_at) {
+                    // Deferred upload work is due at retry_at whether or not the streaming that
+                    // put us to sleep has finished; a bare wait would hold it until some
+                    // unrelated event fired.
+                    co_await await_event_until(*retry_at);
+                } else {
+                    co_await await_event();
+                }
             }
+            co_return;
+        }
+
+        if (!drain && retry_at) {
+            // The plan is empty only because work is held back until a deadline; falling through
+            // would need an event nothing will raise.
+            auto delay = deferred_work_delay(*retry_at);
+            rtlogger.debug("Tablet load balancer is holding work back for {}ms", delay.count());
+            release_guard(std::move(guard));
+            co_await sleep_abortable(delay, _as);
             co_return;
         }
 
@@ -2799,7 +2826,11 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         co_await utils::get_local_injector().inject("tablet_resize_finalization_post_barrier", utils::wait_for_message(std::chrono::minutes(2)));
 
         auto tm = get_token_metadata_ptr();
-        auto plan = co_await _tablet_allocator.balance_tablets(tm, &_topo_sm._topology, &_sys_ks, {}, get_dead_nodes());
+        // Only resize_plan() is consumed here. Uploads are not planned: their plan would be
+        // discarded, but planning records attempts and backoffs, so each discarded slice would
+        // read as a failure and wait out a backoff on the next real pass.
+        auto plan = co_await _tablet_allocator.balance_tablets(tm, &_topo_sm._topology, &_sys_ks, {}, get_dead_nodes(),
+                service::plan_uploads::no);
 
         group0_update_collector updates;
 
@@ -4527,6 +4558,27 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         co_await _topo_sm.event.when();
     }
 
+    // How long to hold off for work the balancer deferred until `retry_at`; bounded so a
+    // far-future deadline cannot park the coordinator.
+    static std::chrono::milliseconds deferred_work_delay(lowres_clock::time_point retry_at) {
+        auto now = lowres_clock::now();
+        return retry_at > now
+                ? std::min(std::chrono::duration_cast<std::chrono::milliseconds>(retry_at - now),
+                           std::chrono::milliseconds(max_deferred_work_wait))
+                : std::chrono::milliseconds(0);
+    }
+
+    // await_event() with a deadline: deferred upload work has to be looked at again by then,
+    // and no event announces that moment.
+    future<> await_event_until(lowres_clock::time_point retry_at) {
+        _as.check();
+        auto delay = deferred_work_delay(retry_at);
+        try {
+            co_await _topo_sm.event.when(delay);
+        } catch (const seastar::condition_variable_timed_out&) {
+        }
+    }
+
     future<> fence_previous_coordinator();
     future<> rollback_current_topology_op(group0_guard&& guard);
 
@@ -4624,6 +4676,14 @@ future<std::optional<group0_guard>> topology_coordinator::maybe_start_tablet_mig
 
     auto plan = co_await _tablet_allocator.balance_tablets(tm, &_topo_sm._topology, &_sys_ks, {}, get_dead_nodes());
     if (plan.empty()) {
+        if (auto retry_at = plan.retry_at()) {
+            // Not idle: work is held back until a deadline that no event will announce.
+            auto delay = deferred_work_delay(*retry_at);
+            rtlogger.debug("Tablet load balancer is holding work back for {}ms", delay.count());
+            release_guard(std::move(guard));
+            co_await sleep_abortable(delay, _as);
+            co_return std::nullopt;
+        }
         rtlogger.debug("Tablet load balancer did not make any plan");
         co_return std::move(guard);
     }

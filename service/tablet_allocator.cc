@@ -89,6 +89,16 @@ void load_balancer_stats_manager::setup_metrics(load_balancer_cluster_stats& sta
             stats.auto_repair_enabled_nr),
         sm::make_counter("repairs_produced", sm::description("number of repairs produced by the load balancer"),
                          stats.repairs_produced),
+        sm::make_counter("uploads_produced", sm::description("number of cluster upload transitions produced by the load balancer"),
+                         stats.uploads_produced),
+        sm::make_counter("uploads_skipped_load", sm::description("number of times a cluster upload was not scheduled because a shard was at its streaming limit"),
+                         stats.uploads_skipped_load),
+        sm::make_gauge("upload_bytes_remaining", sm::description("estimated bytes of cluster upload work not yet consumed"),
+                       stats.upload_bytes_remaining),
+        sm::make_gauge("upload_work_items_remaining", sm::description("number of (source node, tablet) cluster upload work items not yet consumed"),
+                       stats.upload_work_items_remaining),
+        sm::make_gauge("upload_transitions_in_flight", sm::description("number of cluster upload transitions currently in progress"),
+                       stats.upload_transitions_in_flight),
     });
 }
 
@@ -514,8 +524,26 @@ struct fmt::formatter<service::plan_summary> : fmt::formatter<std::string_view> 
         if (!plan.restore_completions().empty()) {
             fmt::format_to(ctx.out(), "{}restore completed for: {}", get_delim(), plan.restore_completions() | std::views::transform(&service::restore_completion_info::table));
         }
+        if (plan.upload_plan().uploads().size()) {
+            fmt::format_to(ctx.out(), "{}uploads: {}", get_delim(), plan.upload_plan().uploads().size());
+        }
+        if (plan.upload_plan().replicates().size()) {
+            fmt::format_to(ctx.out(), "{}upload replications: {}", get_delim(), plan.upload_plan().replicates().size());
+        }
+        if (plan.upload_plan().phase_changes().size()) {
+            fmt::format_to(ctx.out(), "{}upload phase changes: {}", get_delim(), plan.upload_plan().phase_changes().size());
+        }
+        if (!plan.upload_completions().empty()) {
+            fmt::format_to(ctx.out(), "{}upload completed for: {}", get_delim(), plan.upload_completions() | std::views::transform(&service::upload_completion_info::table));
+        }
         if (delim.empty()) {
-            fmt::format_to(ctx.out(), "empty");
+            // Distinct from an idle pass: the balancer has work it is deliberately holding
+            // back, and saying "empty" would have an operator looking for why nothing happens.
+            if (plan.retry_at()) {
+                fmt::format_to(ctx.out(), "nothing runnable yet, work held back");
+            } else {
+                fmt::format_to(ctx.out(), "empty");
+            }
         }
         return ctx.out();
     }
@@ -655,6 +683,67 @@ bool rf_count_per_dc_equals(const locator::replication_strategy_config_options& 
 /// to parallelize execution. This will be addressed in the future by keeping the data structures
 /// valid across calls and only recalculating them when starting a new round with a new token metadata version.
 ///
+// Retry state for cluster upload scheduling, kept between scheduling passes. It lives on the
+// allocator rather than the load balancer, which is rebuilt from scratch every pass - a backoff
+// kept there would never fire.
+struct upload_scheduling_state {
+    // What was last scheduled for a tablet: a transition that succeeds retires its work row, so
+    // finding that row still present with nothing in flight means the attempt failed.
+    struct attempt {
+        locator::host_id host;
+    };
+    // The remaining work of a request, held across passes. Re-reading it every pass does not
+    // scale - rows are (node x tablet) and the coordinator re-plans whenever a transition
+    // completes - and it does not need to: after prepare the list only shrinks, one row at a time,
+    // by a delete this same process makes. Never trusted to complete a request, and re-read in
+    // full periodically because abort tombstones the whole partition with no transition ending.
+    struct request_work {
+        std::unordered_map<uint64_t, std::vector<db::system_keyspace::upload_work_entry>> by_tablet;
+        // Tablets the next pass has to re-read. Planned tablets belong here because a transition
+        // can begin and end between two passes, and would otherwise never be observed leaving.
+        std::unordered_set<uint64_t> in_flight;
+        lowres_clock::time_point last_full_read;
+    };
+    std::unordered_map<utils::UUID, request_work> work;
+
+    std::unordered_map<locator::global_tablet_id, attempt> last_attempt;
+    // Requests seen holding state for a tablet which no longer exists. Should be unreachable, but
+    // a coordinator which has just taken over can be looking at metadata that is still settling,
+    // so it is acted on only if still true next pass.
+    std::unordered_set<utils::UUID> out_of_range_seen;
+    // Phase 2 has no work row, so it is judged by the phase: one still in replicating has failed.
+    std::unordered_set<locator::global_tablet_id> replicate_attempted;
+    std::unordered_map<locator::global_tablet_id, lowres_clock::time_point> retry_after;
+
+    void forget(locator::global_tablet_id gid) {
+        last_attempt.erase(gid);
+        replicate_attempted.erase(gid);
+        retry_after.erase(gid);
+    }
+
+    // The per-tablet maps above are keyed by tablet, so they are cleared by table: otherwise a
+    // request that ends any way other than every tablet reaching done leaves entries the next
+    // request inherits, and a stale last_attempt costs every tablet upload_retry_backoff.
+    void clear() {
+        work.clear();
+        out_of_range_seen.clear();
+        last_attempt.clear();
+        retry_after.clear();
+        replicate_attempted.clear();
+    }
+
+    void forget_request(utils::UUID request_id, std::optional<table_id> table) {
+        work.erase(request_id);
+        out_of_range_seen.erase(request_id);
+        if (!table) {
+            return;
+        }
+        std::erase_if(last_attempt, [t = *table] (const auto& e) { return e.first.table == t; });
+        std::erase_if(retry_after, [t = *table] (const auto& e) { return e.first.table == t; });
+        std::erase_if(replicate_attempted, [t = *table] (const auto& gid) { return gid.table == t; });
+    }
+};
+
 class load_balancer {
     using global_shard_id = tablet_replica;
     using shard_id = seastar::shard_id;
@@ -1157,7 +1246,7 @@ public:
         }
     }
 
-    future<migration_plan> make_plan() {
+    future<migration_plan> make_plan(plan_uploads uploads = plan_uploads::yes) {
         const locator::topology& topo = _tm->get_topology();
         migration_plan plan;
 
@@ -1196,6 +1285,12 @@ public:
 
         co_await check_restore_completions(plan);
 
+        // After repairs and resizes for the same reason repairs are: they compete for the same
+        // per-shard streaming budget.
+        if (uploads) {
+            co_await make_upload_plan(plan);
+        }
+
         auto level = plan.empty() ? seastar::log_level::debug : seastar::log_level::info;
         lblogger.log(level, "Prepared plan: {}", plan_summary(plan));
         co_return std::move(plan);
@@ -1207,6 +1302,10 @@ public:
 
     void set_initial_scale(double initial_scale) {
         _initial_scale = initial_scale;
+    }
+
+    void set_upload_scheduling_state(upload_scheduling_state& state) {
+        _upload_state = &state;
     }
 
     const locator::table_load_stats* load_stats_for_table(table_id id) const {
@@ -1321,6 +1420,772 @@ public:
             auto streaming_info = get_migration_streaming_info(topo, tinfo, tmi);
             apply_load(nodes, streaming_info);
         }
+    }
+
+    // Armed only after a failure: a tablet has one slice per source node and they stream one after
+    // another, so delaying each would idle the tablet between slices.
+    static constexpr auto upload_retry_backoff = std::chrono::seconds(5);
+
+    // deadline is set when the answer is "not yet", so the caller can arrange to be woken: nothing
+    // else will, since a slice held back on a timer is not waiting on a transition or a group0
+    // write, and the coordinator would park until an unrelated event turned up.
+    bool upload_backoff_elapsed(locator::global_tablet_id gid, bool failed, lowres_clock::time_point now,
+            lowres_clock::time_point& deadline) {
+        if (!failed) {
+            _upload_state->retry_after.erase(gid);
+            return true;
+        }
+        auto [it, inserted] = _upload_state->retry_after.try_emplace(gid, now + upload_retry_backoff);
+        if (inserted || now < it->second) {
+            deadline = it->second;
+            return false;
+        }
+        _upload_state->retry_after.erase(it);
+        return true;
+    }
+
+    // Rebuilt each pass but seeded from the transitions already running, so it describes real load.
+    // Upload work is sliced per (source node, shard, tablet), so limiting it by count the way
+    // migrations are limited would make per-transition latency the bottleneck.
+    struct upload_shard_budget {
+        uint64_t bytes = 0;
+        unsigned transitions = 0;
+    };
+    using upload_budget_map = std::unordered_map<locator::tablet_replica, upload_shard_budget>;
+
+    // target_bytes is a floor to fill to, not a ceiling: the design asks for batches of at least
+    // 1 GB per shard so the per-transition overhead is amortised, so the slice that crosses the
+    // target overshoots. Read as a ceiling, it would park a shard just below it and reject any
+    // slice larger than the whole budget. max_transitions is the real ceiling, bounding sessions
+    // and reader permits whatever their size - including work charged as zero bytes.
+    bool upload_shard_can_accept(const upload_budget_map& budget, locator::tablet_replica shard,
+            uint64_t target_bytes, unsigned max_transitions) const {
+        auto it = budget.find(shard);
+        if (it == budget.end()) {
+            return true;
+        }
+        if (it->second.transitions >= max_transitions) {
+            return false;
+        }
+        return it->second.bytes < target_bytes;
+    }
+
+    void upload_shard_apply(upload_budget_map& budget, locator::tablet_replica shard, uint64_t bytes) {
+        auto& b = budget[shard];
+        b.bytes += bytes;
+        b.transitions++;
+    }
+
+    // locality(w) from the design: 0 same node, -1 same rack, -2 same dc, -3 same cluster. Measured
+    // to the primary, the single replica phase 1 streams to; the primary is itself picked to sit in
+    // a DC holding source data, so the pair together is the design's "match within a DC".
+    // 0 same node, -1 same rack, -2 same DC, -3 elsewhere: the sign flip of
+    // locator::topology::distance(), which encodes the same order.
+    int upload_locality(const locator::topology& topo, locator::host_id primary,
+            locator::host_id source) const {
+        auto* p = topo.find_node(primary);
+        auto* src = topo.find_node(source);
+        if (!p || !src) {
+            return -3;
+        }
+        return -locator::topology::distance(primary, p->dc_rack(), source, src->dc_rack());
+    }
+
+    // Used to walk candidates least-loaded first, so large work lands on idle nodes. Phase 1 writes
+    // to a single replica, so the key is the load of the lightest one - the busiest would push a
+    // tablet down the list because of a replica which receives nothing. Optimistic rather than the
+    // primary's actual load; each tablet is still admitted against the real budget of its shards.
+    // Load key of one replica: its node's average load first, its shard's streaming load second.
+    std::optional<std::pair<load_type, uint64_t>> upload_replica_load(const node_load_map& nodes,
+            const locator::tablet_replica& r) const {
+        auto it = nodes.find(r.host);
+        if (it == nodes.end()) {
+            return std::nullopt;
+        }
+        uint64_t shard_load = 0;
+        if (r.shard < it->second.shards.size()) {
+            auto& sl = it->second.shards[r.shard];
+            shard_load = sl.total_read_load() + sl.total_write_load();
+        }
+        return std::pair<load_type, uint64_t>{it->second.avg_load, shard_load};
+    }
+
+    std::pair<load_type, uint64_t> upload_candidate_load(const node_load_map& nodes,
+            const locator::tablet_info& tinfo) const {
+        std::optional<std::pair<load_type, uint64_t>> best;
+        for (const auto& r : tinfo.replicas) {
+            auto candidate = upload_replica_load(nodes, r);
+            if (candidate && (!best || *candidate < *best)) {
+                best = *candidate;
+            }
+        }
+        return best.value_or(std::pair<load_type, uint64_t>{0, 0});
+    }
+
+    upload_scheduling_state* _upload_state = nullptr;
+
+    // Nothing terminal is decided from the cache, so this only bounds how long a pass may plan
+    // against rows another coordinator has since consumed - a retried transition, not data loss.
+    static constexpr auto upload_work_refresh_interval = std::chrono::seconds(30);
+
+    future<upload_scheduling_state::request_work*> get_upload_work_cached(utils::UUID request_id,
+            const std::unordered_set<uint64_t>& in_flight_now, lowres_clock::time_point now) {
+        auto& cached = _upload_state->work[request_id];
+        bool full = cached.last_full_read == lowres_clock::time_point{}
+                || now - cached.last_full_read >= upload_work_refresh_interval;
+        if (full) {
+            auto work = co_await _sys_ks->get_upload_work(request_id);
+            cached.by_tablet.clear();
+            for (auto& e : work.entries) {
+                cached.by_tablet[e.tablet_id].push_back(std::move(e));
+            }
+            cached.last_full_read = now;
+            lblogger.debug("upload work for {} read in full: {} tablet(s)", request_id, cached.by_tablet.size());
+        } else {
+            // A tablet which had a transition last pass and has none now has finished or failed it.
+            // The re-read also says which: a successful transition retires its row.
+            size_t refreshed = 0;
+            for (auto tablet_id : cached.in_flight) {
+                if (in_flight_now.contains(tablet_id)) {
+                    continue;
+                }
+                auto slice = co_await _sys_ks->get_upload_work_for_tablet(request_id, tablet_id);
+                cached.by_tablet.erase(tablet_id);
+                for (auto& e : slice.entries) {
+                    cached.by_tablet[e.tablet_id].push_back(std::move(e));
+                }
+                refreshed++;
+            }
+            lblogger.debug("upload work for {} reused from cache, {} tablet(s) refreshed", request_id, refreshed);
+        }
+        cached.in_flight = in_flight_now;
+        co_return &cached;
+    }
+
+    // Only asked when the cache says so, because finishing a request is the one decision a stale
+    // view must not be allowed to make.
+    future<bool> upload_work_is_really_empty(utils::UUID request_id) {
+        auto work = co_await _sys_ks->get_upload_work(request_id);
+        co_return work.entries.empty();
+    }
+
+    bool ongoing_upload() const {
+        return _topology != nullptr && _sys_ks != nullptr && _upload_state != nullptr
+                && !_topology->ongoing_upload_requests.empty();
+    }
+
+    // One tablet at a time, within the per-shard streaming budget. A tablet gets at most one
+    // in-flight transition even when several nodes hold data for it: two sources writing it
+    // concurrently would double the write load on its replicas without finishing it sooner.
+    future<> make_upload_plan(migration_plan& plan) {
+        if (!ongoing_upload()) {
+            // The completion paths below release state as they retire a request, but one finished
+            // by another coordinator is never visited again and would sit here forever.
+            if (_upload_state) {
+                _upload_state->clear();
+            }
+            co_return;
+        }
+
+        const locator::topology& topo = _tm->get_topology();
+        node_load_map nodes;
+        topo.for_each_node([&] (const locator::node& node) {
+            // The skiplist is the nodes gossip reports down. Left out here, a dead source is held
+            // back as unavailable rather than handed slices that fail, and a dead replica is never
+            // picked as a tablet's primary - a choice that is fixed for the life of the request.
+            if (node.get_state() == locator::node::state::normal && !_skiplist.contains(node.host_id())) {
+                ensure_node(nodes, node.host_id());
+            }
+        });
+        co_await consider_scheduled_load(nodes);
+        co_await consider_planned_load(nodes, plan);
+
+        tablet_upload_plan upload_plan;
+        auto now = lowres_clock::now();
+        upload_budget_map upload_budget;
+        const uint64_t upload_target_bytes = uint64_t(_db.get_config().tablet_upload_batch_size_in_mb()) * 1024 * 1024;
+        const unsigned upload_max_transitions = _db.get_config().tablet_upload_concurrency_per_shard();
+        uint64_t bytes_remaining = 0;
+        uint64_t items_remaining = 0;
+        uint64_t in_flight = 0;
+
+        // Seeded across every ongoing request before any is planned: the budget is per shard and
+        // shards are shared by every table, but a request's transitions live in its own table's
+        // tablet map, so two concurrent uploads would run at twice the configured rate.
+        std::unordered_set<utils::UUID> live_requests;
+        std::unordered_set<table_id> live_tables;
+        // One row read per request per pass; the seed loop and the planning loop share it.
+        std::unordered_map<utils::UUID, db::system_keyspace::topology_requests_entry> request_entries;
+        for (const auto& request_id : _topology->ongoing_upload_requests) {
+            request_entries.emplace(request_id, co_await _sys_ks->get_topology_request_entry(request_id));
+        }
+        for (const auto& seed_request_id : _topology->ongoing_upload_requests) {
+            live_requests.insert(seed_request_id);
+            const auto& seed_entry = request_entries.at(seed_request_id);
+            if (!seed_entry.upload_table_id
+                    || !_tm->tablets().has_tablet_map(*seed_entry.upload_table_id)) {
+                continue;
+            }
+            live_tables.insert(*seed_entry.upload_table_id);
+            const auto& seed_tmap = _tm->tablets().get_tablet_map(*seed_entry.upload_table_id);
+            std::unordered_set<uint64_t> seed_in_flight;
+            for (auto&& [tid, trinfo] : seed_tmap.transitions()) {
+                co_await coroutine::maybe_yield();
+                if (trinfo.transition == locator::tablet_transition_kind::upload
+                        && trinfo.upload_info && trinfo.upload_info->request_id == seed_request_id) {
+                    seed_in_flight.insert(tid.value());
+                }
+            }
+            // Also primes the cache entry, so the planning loop's own call neither re-reads nor
+            // inserts into the map - which matters, because it holds a pointer into it.
+            auto* seed_cached = co_await get_upload_work_cached(seed_request_id, seed_in_flight, now);
+
+            // Charge what is already streaming before deciding what else to start: the budget map
+            // is rebuilt every pass but transitions outlive a pass, so without this in-flight work
+            // would grow with the number of passes. The byte figure comes from the work row, which
+            // is only retired once the transition completes.
+            for (auto&& [tid, trinfo] : seed_tmap.transitions()) {
+                co_await coroutine::maybe_yield();
+                bool is_upload = trinfo.transition == locator::tablet_transition_kind::upload;
+                if (!is_upload && trinfo.transition != locator::tablet_transition_kind::upload_replicate) {
+                    continue;
+                }
+                if (!trinfo.upload_info || trinfo.upload_info->request_id != seed_request_id) {
+                    continue;
+                }
+                const auto& ui = *trinfo.upload_info;
+                uint64_t bytes = 0;
+                // Per source shard, as the pass below charges a new one; an even split otherwise.
+                std::unordered_map<shard_id, uint64_t> bytes_by_shard;
+                if (!is_upload) {
+                    // Whole-tablet copy. Absent when load stats have not caught up with what phase 1
+                    // wrote, and then charged nothing, exactly as planning does.
+                    bytes = get_avg_tablet_size(seed_tmap, *seed_entry.upload_table_id, tid).value_or(0);
+                } else {
+                    if (auto it = seed_cached->by_tablet.find(tid.value());
+                            it != seed_cached->by_tablet.end()) {
+                        auto e = std::ranges::find_if(it->second, [&] (const auto& e) {
+                            return e.host == ui.source_host;
+                        });
+                        if (e != it->second.end()) {
+                            bytes = e->estimated_bytes;
+                            for (size_t i = 0; i < e->shards.size(); i++) {
+                                bytes_by_shard[e->shards[i]] = e->shard_bytes[i];
+                            }
+                        }
+                    }
+                }
+                auto tmsi = get_migration_streaming_info(topo, seed_tmap.get_tablet_info(tid), trinfo);
+                auto even_split = tmsi.read_from.empty() ? 0 : bytes / tmsi.read_from.size();
+                for (auto&& r : tmsi.read_from) {
+                    auto bit = bytes_by_shard.find(r.shard);
+                    upload_shard_apply(upload_budget, r, bit != bytes_by_shard.end() ? bit->second : even_split);
+                }
+                for (auto&& w : tmsi.written_to) {
+                    upload_shard_apply(upload_budget, w, bytes);
+                }
+            }
+        }
+
+        std::erase_if(_upload_state->work,
+                [&] (const auto& e) { return !live_requests.contains(e.first); });
+        std::erase_if(_upload_state->out_of_range_seen,
+                [&] (const auto& id) { return !live_requests.contains(id); });
+        std::erase_if(_upload_state->last_attempt,
+                [&] (const auto& e) { return !live_tables.contains(e.first.table); });
+        std::erase_if(_upload_state->retry_after,
+                [&] (const auto& e) { return !live_tables.contains(e.first.table); });
+        std::erase_if(_upload_state->replicate_attempted,
+                [&] (const auto& gid) { return !live_tables.contains(gid.table); });
+
+        for (const auto& request_id : _topology->ongoing_upload_requests) {
+            const auto& req_entry = request_entries.at(request_id);
+            if (!req_entry.upload_table_id) {
+                _upload_state->forget_request(request_id, std::nullopt);
+                plan.add_upload_completion(upload_completion_info{.request_id = request_id});
+                continue;
+            }
+            auto table = *req_entry.upload_table_id;
+
+            // Checked before the work list rather than through it: an abort clears the work
+            // partition, but the cached view of it can be up to upload_work_refresh_interval old,
+            // and transitions started from those stale rows really stream - del_session cannot stop
+            // them, because each new transition opens a session of its own.
+            if (!req_entry.error.empty()) {
+                lblogger.info("Upload request {} of {} has a terminal outcome recorded ({}); "
+                        "completing it without scheduling further work", request_id, table, req_entry.error);
+                _upload_state->forget_request(request_id, table);
+                plan.add_upload_completion(upload_completion_info{
+                    .request_id = request_id, .table = table, .error = req_entry.error});
+                continue;
+            }
+
+            if (!_tm->tablets().has_tablet_map(table)) {
+                _upload_state->forget_request(request_id, table);
+                plan.add_upload_completion(upload_completion_info{
+                    .request_id = request_id,
+                    .table = table,
+                    .error = format("Table {} was dropped during upload", table),
+                });
+                continue;
+            }
+            auto tstate = co_await _sys_ks->get_upload_tablet_state(request_id);
+            bool primary_only_mode = req_entry.upload_primary_replica_only;
+
+            const auto& tmap = _tm->tablets().get_tablet_map(table);
+
+            std::unordered_set<uint64_t> upload_in_flight;
+            for (auto&& [tid, trinfo] : tmap.transitions()) {
+                co_await coroutine::maybe_yield();
+                // Both kinds count for the gauge, which is described as every upload transition
+                // in progress; the work cache's in-flight set is phase 1 only.
+                if (trinfo.transition == locator::tablet_transition_kind::upload) {
+                    in_flight++;
+                    if (trinfo.upload_info && trinfo.upload_info->request_id == request_id) {
+                        upload_in_flight.insert(tid.value());
+                    }
+                } else if (trinfo.transition == locator::tablet_transition_kind::upload_replicate) {
+                    in_flight++;
+                }
+            }
+
+            auto* cached = co_await get_upload_work_cached(request_id, upload_in_flight, now);
+            const auto& by_tablet = cached->by_tablet;
+
+            if (by_tablet.empty()) {
+                // Confirmed against group0 rather than taken from the cache: finishing a request
+                // that still has work would report a load successful having skipped part of it.
+                if (co_await upload_work_is_really_empty(request_id)) {
+                    bool all_done = std::ranges::all_of(tstate, [] (const auto& e) {
+                        return e.second.phase == db::system_keyspace::upload_phase::done;
+                    });
+                    if (tstate.empty() || all_done) {
+                        // Any terminal reason already on the request row is carried into the
+                        // completion: an abort drops the work to make the request finish, and
+                        // without this that is indistinguishable from a load that ran to the end.
+                        _upload_state->forget_request(request_id, table);
+                        plan.add_upload_completion(upload_completion_info{
+                            .request_id = request_id, .table = table, .error = req_entry.error});
+                        continue;
+                    }
+                } else {
+                    // The cache was behind; it is authoritative again next pass.
+                    cached->last_full_read = {};
+                    continue;
+                }
+            }
+
+            for (const auto& [tablet_id, entries] : by_tablet) {
+                items_remaining += entries.size();
+                for (const auto& e : entries) {
+                    bytes_remaining += e.estimated_bytes;
+                }
+            }
+
+            // Tablet ids are resolved against the map the request was prepared with, so a count
+            // which has shrunk leaves rows naming tablets that no longer exist. Such work can never
+            // be placed, and it keeps the table's resizing blocked, so fail the request.
+            std::optional<uint64_t> out_of_range;
+            for (const auto& [tablet_id, _] : by_tablet) {
+                if (tablet_id >= tmap.tablet_count()) {
+                    out_of_range = tablet_id;
+                    break;
+                }
+            }
+            for (const auto& [tablet_id, _] : tstate) {
+                if (tablet_id >= tmap.tablet_count()) {
+                    out_of_range = tablet_id;
+                    break;
+                }
+            }
+            if (out_of_range) {
+                // Skip either way, but fail only once the condition has outlived a pass.
+                if (_upload_state->out_of_range_seen.insert(request_id).second) {
+                    lblogger.warn("Upload request {} holds state for tablet {} of {}, past its tablet count {}; "
+                            "failing the request if this is still true next pass",
+                            request_id, *out_of_range, table, tmap.tablet_count());
+                    continue;
+                }
+                plan.add_upload_completion(upload_completion_info{
+                    .request_id = request_id,
+                    .table = table,
+                    .error = format("Tablet count of {} is {}, but the upload request holds state for tablet {}; "
+                                    "the table was resized while the upload was in flight and its remaining work "
+                                    "can no longer be placed", table, tmap.tablet_count(), *out_of_range),
+                });
+                _upload_state->forget_request(request_id, table);
+                continue;
+            }
+            // Consecutive sightings are what count, so a one-off clears the record.
+            _upload_state->out_of_range_seen.erase(request_id);
+
+            // A primary is fixed once phase 1 has put data on it. A plain migration carries it
+            // along - the coordinator moves it to the pending replica at end_migration - so what
+            // is left here is a primary that was rebuilt elsewhere or removed. Its share of the
+            // data is not known to be anywhere the request could replicate from, so the request
+            // cannot finish; failing it beats holding the tablet, and the table's resizing, forever.
+            std::optional<sstring> lost_primary;
+            for (const auto& [tablet_id, st] : tstate) {
+                co_await coroutine::maybe_yield();
+                if (st.phase == db::system_keyspace::upload_phase::done || !st.primary_host) {
+                    continue;
+                }
+                const auto& tinfo = tmap.get_tablet_info(locator::tablet_id(tablet_id));
+                if (!locator::contains(tinfo.replicas, *st.primary_host)) {
+                    lost_primary = format("Primary replica {} of tablet {} of {} is no longer a replica: the tablet "
+                            "was moved by a topology change while its upload was in flight, and the data already "
+                            "uploaded to it cannot be located. The sstables not yet consumed are left in the upload "
+                            "directories; re-run the upload once the topology has settled, and repair the table",
+                            *st.primary_host, tablet_id, table);
+                    break;
+                }
+            }
+            if (lost_primary) {
+                lblogger.warn("Upload request {} failed: {}", request_id, *lost_primary);
+                _upload_state->forget_request(request_id, table);
+                plan.add_upload_completion(upload_completion_info{
+                    .request_id = request_id,
+                    .table = table,
+                    .error = std::move(*lost_primary),
+                });
+                continue;
+            }
+
+            // To replicating, or straight to done in primary-replica-only mode.
+            std::unordered_set<uint64_t> tablets_with_work;
+            for (const auto& [tablet_id, _] : by_tablet) {
+                tablets_with_work.insert(tablet_id);
+            }
+            for (const auto& [tablet_id, st] : tstate) {
+                co_await coroutine::maybe_yield();
+                if (st.phase == db::system_keyspace::upload_phase::done) {
+                    _upload_state->forget(locator::global_tablet_id{table, locator::tablet_id(tablet_id)});
+                }
+                if (st.phase != db::system_keyspace::upload_phase::uploading || tablets_with_work.contains(tablet_id)) {
+                    continue;
+                }
+                upload_plan.add(upload_phase_change{
+                    .request_id = request_id,
+                    .tablet_id = tablet_id,
+                    .phase = primary_only_mode ? db::system_keyspace::upload_phase::done
+                                               : db::system_keyspace::upload_phase::replicating,
+                });
+            }
+
+            // Separate from phase 1 because it loads different nodes: reading from the primary and
+            // writing to the remaining replicas, with no source node involved.
+            for (const auto& [tablet_id, st] : tstate) {
+                co_await coroutine::maybe_yield();
+                if (st.phase != db::system_keyspace::upload_phase::replicating || !st.primary_host) {
+                    continue;
+                }
+                auto tid = locator::tablet_id(tablet_id);
+                if (tmap.get_tablet_transition_info(tid)) {
+                    continue;
+                }
+                auto& tinfo = tmap.get_tablet_info(tid);
+                if (tablet_has_excluded_node(topo, tinfo)) {
+                    continue;
+                }
+                auto rep_gid = locator::global_tablet_id{table, tid};
+                if (_upload_state->replicate_attempted.contains(rep_gid)) {
+                    lowres_clock::time_point rep_deadline;
+                    if (!upload_backoff_elapsed(rep_gid, true, now, rep_deadline)) {
+                        plan.retry_no_later_than(rep_deadline);
+                        continue;
+                    }
+                }
+                if (tinfo.replicas.size() < 2) {
+                    upload_plan.add(upload_phase_change{
+                        .request_id = request_id,
+                        .tablet_id = tablet_id,
+                        .phase = db::system_keyspace::upload_phase::done,
+                    });
+                    continue;
+                }
+                auto primary = *st.primary_host;
+                auto primary_shard = std::ranges::find_if(tinfo.replicas,
+                        [&] (auto& r) { return r.host == primary; });
+                if (primary_shard == tinfo.replicas.end()) {
+                    // Unreachable: a lost primary fails the request above, before anything is
+                    // scheduled. Kept as a guard against scheduling from a non-replica.
+                    lblogger.warn("Upload replication for tablet {} of {} skipped: assigned primary {} "
+                            "is no longer a replica", tablet_id, table, *st.primary_host);
+                    continue;
+                }
+                auto src = locator::tablet_replica{primary, primary_shard->shard};
+                bool fits = upload_shard_can_accept(upload_budget, src, upload_target_bytes, upload_max_transitions);
+                for (auto&& r : tinfo.replicas) {
+                    if (r.host == primary) {
+                        continue;
+                    }
+                    fits = fits && upload_shard_can_accept(upload_budget, r, upload_target_bytes, upload_max_transitions);
+                }
+                if (!fits) {
+                    ++_stats.for_cluster().uploads_skipped_load;
+                    continue;
+                }
+                // A whole-tablet copy, so it moves real bytes and is charged for them like phase 1;
+                // charged nothing, a shard could take on more replication than the target allows.
+                auto replicate_bytes = get_avg_tablet_size(tmap, table, tid).value_or(0);
+                upload_shard_apply(upload_budget, src, replicate_bytes);
+                for (auto&& r : tinfo.replicas) {
+                    if (r.host != primary) {
+                        upload_shard_apply(upload_budget, r, replicate_bytes);
+                    }
+                }
+                _upload_state->replicate_attempted.insert(rep_gid);
+                upload_plan.add(upload_replicate_assignment{
+                    .tablet = locator::global_tablet_id{table, tid},
+                    .primary_host = primary,
+                    .request_id = request_id,
+                });
+                ++_stats.for_cluster().uploads_produced;
+            }
+
+            if (by_tablet.empty()) {
+                continue;
+            }
+
+            // Work whose source node has left the cluster can never be consumed, and skipping it
+            // silently would leave the request running forever. A node still in the topology but
+            // not in normal state may come back, so its work is passed over rather than failing an
+            // otherwise healthy request.
+            std::optional<locator::host_id> departed;
+            std::unordered_set<locator::host_id> unavailable;
+            for (const auto& [tablet_id, entries] : by_tablet) {
+                for (const auto& e : entries) {
+                    if (nodes.contains(e.host)) {
+                        continue;
+                    }
+                    if (!topo.find_node(e.host)) {
+                        departed = e.host;
+                        break;
+                    }
+                    unavailable.insert(e.host);
+                }
+                if (departed) {
+                    break;
+                }
+            }
+            if (!departed && !unavailable.empty()) {
+                lblogger.debug("Upload of {} is holding back work from {} source node(s) not in normal state: {}",
+                        table, unavailable.size(), fmt::join(unavailable, ", "));
+            }
+            if (departed) {
+                _upload_state->forget_request(request_id, table);
+                plan.add_upload_completion(upload_completion_info{
+                    .request_id = request_id,
+                    .table = table,
+                    .error = format("Upload source {} left the cluster with work outstanding; "
+                                    "its share of the data was not loaded", *departed),
+                });
+                continue;
+            }
+
+            // Least-loaded first: hash-map order would let a busy node keep taking work.
+            // Keys are computed once and sorted decorated; a plain comparator would redo the
+            // per-replica lookups on every comparison.
+            std::vector<std::pair<std::pair<load_type, uint64_t>, uint64_t>> candidate_order;
+            candidate_order.reserve(by_tablet.size());
+            for (const auto& [tablet_id, _] : by_tablet) {
+                auto key = tablet_id < tmap.tablet_count()
+                        ? upload_candidate_load(nodes, tmap.get_tablet_info(locator::tablet_id(tablet_id)))
+                        : std::pair<load_type, uint64_t>{std::numeric_limits<load_type>::max(),
+                                                         std::numeric_limits<uint64_t>::max()};
+                candidate_order.emplace_back(key, tablet_id);
+            }
+            std::ranges::sort(candidate_order);
+
+            for (auto [candidate_key, tablet_id] : candidate_order) {
+                // Take a view rather than reordering the cache - it outlives this pass.
+                std::vector<const db::system_keyspace::upload_work_entry*> entries;
+                for (const auto& e : by_tablet.at(tablet_id)) {
+                    entries.push_back(&e);
+                }
+                co_await coroutine::maybe_yield();
+                auto tid = locator::tablet_id(tablet_id);
+                auto gid = locator::global_tablet_id{table, tid};
+                if (tmap.get_tablet_transition_info(tid)) {
+                    continue;
+                }
+                // A failed transition is cleared but its work row is kept so the slice can be
+                // retried, and without a delay the balancer would respin it as fast as it cycles.
+                if (auto it = _upload_state->last_attempt.find(gid); it != _upload_state->last_attempt.end()) {
+                    bool failed = std::ranges::any_of(entries, [&] (const auto* e) {
+                        return e->host == it->second.host;
+                    });
+                    if (!failed) {
+                        _upload_state->last_attempt.erase(it);
+                    }
+                    lowres_clock::time_point deadline;
+                    if (!upload_backoff_elapsed(gid, failed, now, deadline)) {
+                        plan.retry_no_later_than(deadline);
+                        continue;
+                    }
+                }
+                auto& tinfo = tmap.get_tablet_info(tid);
+                if (tablet_has_excluded_node(topo, tinfo)) {
+                    continue;
+                }
+
+                // Phase 1 streams to the primary, so a primary in a DC holding none of this
+                // tablet's data drags the whole slice across the WAN.
+                std::unordered_map<sstring, uint64_t> source_bytes_by_dc;
+                for (auto* e : entries) {
+                    if (unavailable.contains(e->host)) {
+                        continue;
+                    }
+                    if (auto* n = topo.find_node(e->host)) {
+                        source_bytes_by_dc[n->dc_rack().dc] += e->estimated_bytes;
+                    }
+                }
+
+                // Chosen once per tablet and then fixed, so phase 2 knows where the data landed,
+                // and before the sources are ordered, because their distance is measured to it.
+                std::optional<locator::host_id> primary;
+                if (auto it = tstate.find(tablet_id); it != tstate.end() && it->second.primary_host) {
+                    primary = it->second.primary_host;
+                    if (!locator::contains(tinfo.replicas, *primary)) {
+                        // Unreachable: a lost primary fails the request before this loop. Kept as
+                        // a guard against streaming to a non-replica.
+                        lblogger.warn("Upload of tablet {} of {} skipped: assigned primary {} is no "
+                                "longer a replica", tablet_id, table, *primary);
+                        continue;
+                    }
+                }
+                bool assigning_primary = !primary;
+                if (!primary) {
+                    // Locality first, load second: a cross-DC stream costs orders of magnitude more
+                    // than the imbalance load-ordering avoids. Load still decides among equally
+                    // local candidates, which keeps primaries off the few nodes a static rule would
+                    // pile them onto.
+                    // Only replicas that are up: nodes leaves out the skiplist.
+                    auto up_replicas = tinfo.replicas | std::views::filter([&] (const locator::tablet_replica& r) {
+                        return nodes.contains(r.host);
+                    });
+                    auto least = std::ranges::min_element(up_replicas, [&] (auto& a, auto& b) {
+                        auto local_bytes = [&] (const locator::tablet_replica& r) -> uint64_t {
+                            auto* n = topo.find_node(r.host);
+                            if (!n) {
+                                return 0;
+                            }
+                            auto it = source_bytes_by_dc.find(n->dc_rack().dc);
+                            return it == source_bytes_by_dc.end() ? 0 : it->second;
+                        };
+                        auto la = local_bytes(a);
+                        auto lb = local_bytes(b);
+                        if (la != lb) {
+                            return la > lb;
+                        }
+                        auto load = [&] (const locator::tablet_replica& r) {
+                            // up_replicas holds only replicas present in nodes.
+                            return *upload_replica_load(nodes, r);
+                        };
+                        return load(a) < load(b);
+                    });
+                    if (least == up_replicas.end()) {
+                        lblogger.debug("Upload of tablet {} of {} is waiting: none of its replicas is up", tablet_id, table);
+                        continue;
+                    }
+                    primary = least->host;
+                }
+
+                // Closer sources first, and among equally close ones the largest slice, so big work
+                // is placed while the budget is free. Distance is to the primary.
+                std::ranges::sort(entries, [&] (auto* a, auto* b) {
+                    auto la = upload_locality(topo, *primary, a->host);
+                    auto lb = upload_locality(topo, *primary, b->host);
+                    if (la != lb) {
+                        return la > lb;
+                    }
+                    return a->estimated_bytes > b->estimated_bytes;
+                });
+                for (auto* e : entries) {
+                    if (unavailable.contains(e->host)) {
+                        continue;
+                    }
+                    auto trinfo = tablet_transition_info(locator::tablet_transition_stage::upload,
+                            locator::tablet_transition_kind::upload, tinfo.replicas, {}, service::session_id(),
+                            sstring(), locator::tablet_upload_info{
+                                .source_host = e->host,
+                                .source_shards = e->shards,
+                                .primary_host = *primary,
+                            });
+                    auto tmsi = get_migration_streaming_info(topo, tinfo, trinfo);
+
+                    // Size budget rather than can_accept_load()'s transition count: upload runs last,
+                    // so the count-based budget is already spoken for. Both ends have to be under
+                    // the target, and every source shard has to have room, since the transition
+                    // reads from all of them at once - the cost of a per-(node, tablet) unit of
+                    // work, which is what keeps the work list from being multiplied by shard count.
+                    bool fits = std::ranges::all_of(e->shards, [&] (shard_id s) {
+                        return upload_shard_can_accept(upload_budget, locator::tablet_replica{e->host, s},
+                                upload_target_bytes, upload_max_transitions);
+                    });
+                    if (fits) {
+                        for (auto&& w : tmsi.written_to) {
+                            if (!upload_shard_can_accept(upload_budget, w,
+                                        upload_target_bytes, upload_max_transitions)) {
+                                fits = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!fits) {
+                        ++_stats.for_cluster().uploads_skipped_load;
+                        continue;
+                    }
+
+                    // Each source shard reads its own slice: charging every one the tablet total
+                    // would divide the per-shard budget by the number of shards.
+                    for (size_t i = 0; i < e->shards.size(); i++) {
+                        upload_shard_apply(upload_budget, locator::tablet_replica{e->host, e->shards[i]},
+                                e->shard_bytes[i]);
+                    }
+                    for (auto&& w : tmsi.written_to) {
+                        upload_shard_apply(upload_budget, w, e->estimated_bytes);
+                    }
+                    // Keeps the rest of this pass honest: nodes is built fresh here and the load
+                    // totals fold the upload counters in. Not for later cycles - they rebuild nodes
+                    // from transitions actually in flight.
+                    apply_load(nodes, tmsi);
+                    ++_stats.for_cluster().uploads_produced;
+                    _upload_state->last_attempt[gid] = upload_scheduling_state::attempt{.host = e->host};
+                    // Treated as in flight from here, not from whichever later pass first sees the
+                    // transition: it can be created and completed between two passes, so the
+                    // "was in flight, now is not" test would never fire and the next pass would hand
+                    // out the same slice again. Harmless for ordinary rows and wrong for counters.
+                    cached->in_flight.insert(tablet_id);
+                    upload_plan.add(upload_work_assignment{
+                        .tablet = gid,
+                        .source_host = e->host,
+                        .source_shards = e->shards,
+                        .primary_host = *primary,
+                        .request_id = request_id,
+                    });
+                    if (assigning_primary) {
+                        upload_plan.add(upload_phase_change{
+                            .request_id = request_id,
+                            .tablet_id = tablet_id,
+                            .phase = db::system_keyspace::upload_phase::uploading,
+                            .assign_primary = *primary,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+
+        _stats.for_cluster().upload_bytes_remaining = bytes_remaining;
+        _stats.for_cluster().upload_work_items_remaining = items_remaining;
+        _stats.for_cluster().upload_transitions_in_flight = in_flight;
+
+        if (upload_plan.size()) {
+            lblogger.info("Scheduling {} upload transitions ({} MiB/shard target), {} work items and {} bytes remaining, {} in flight",
+                    upload_plan.size(), _db.get_config().tablet_upload_batch_size_in_mb(), items_remaining, bytes_remaining, in_flight);
+        }
+        plan.set_upload_plan(std::move(upload_plan));
     }
 
     future<tablet_repair_plan> make_repair_plan(const migration_plan& mplan) {
@@ -4768,6 +5633,8 @@ class tablet_allocator_impl : public tablet_allocator::impl
     bool _use_tablet_aware_balancing = true;
     locator::load_stats_ptr _load_stats;
 private:
+    upload_scheduling_state _upload_scheduling_state;
+
     load_balancer make_load_balancer(token_metadata_ptr tm,
             service::topology* topology,
             db::system_keyspace* sys_ks,
@@ -4779,6 +5646,7 @@ private:
             std::move(skiplist));
         lb.set_use_table_aware_balancing(_use_tablet_aware_balancing);
         lb.set_initial_scale(_db.get_config().tablets_initial_scale_factor());
+        lb.set_upload_scheduling_state(_upload_scheduling_state);
         return lb;
     }
 public:
@@ -4802,10 +5670,10 @@ public:
         _stopped = true;
     }
 
-    future<migration_plan> balance_tablets(token_metadata_ptr tm, service::topology* topology, db::system_keyspace* sys_ks, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist) {
+    future<migration_plan> balance_tablets(token_metadata_ptr tm, service::topology* topology, db::system_keyspace* sys_ks, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist, plan_uploads uploads) {
         auto lb = make_load_balancer(tm, topology, sys_ks, table_load_stats ? table_load_stats : _load_stats, std::move(skiplist));
         co_await coroutine::switch_to(_background);
-        co_return co_await lb.make_plan();
+        co_return co_await lb.make_plan(uploads);
     }
 
     void set_load_stats(locator::load_stats_ptr load_stats) {
@@ -5101,8 +5969,8 @@ future<> tablet_allocator::stop() {
     return impl().stop();
 }
 
-future<migration_plan> tablet_allocator::balance_tablets(locator::token_metadata_ptr tm, service::topology* topology, db::system_keyspace* sys_ks, locator::load_stats_ptr load_stats, std::unordered_set<host_id> skiplist) {
-    return impl().balance_tablets(std::move(tm), topology, sys_ks, std::move(load_stats), std::move(skiplist));
+future<migration_plan> tablet_allocator::balance_tablets(locator::token_metadata_ptr tm, service::topology* topology, db::system_keyspace* sys_ks, locator::load_stats_ptr load_stats, std::unordered_set<host_id> skiplist, plan_uploads uploads) {
+    return impl().balance_tablets(std::move(tm), topology, sys_ks, std::move(load_stats), std::move(skiplist), uploads);
 }
 
 void tablet_allocator::set_load_stats(locator::load_stats_ptr load_stats) {
