@@ -435,6 +435,8 @@ public:
         std::optional<sstring> finalize_migration_ks_name;
         std::optional<table_id> restore_table_id;
         std::optional<sstring> restore_snapshot_name;
+        std::optional<table_id> upload_table_id;
+        bool upload_primary_replica_only = false;
     };
     using topology_requests_entries = std::unordered_map<utils::UUID, system_keyspace::topology_requests_entry>;
 

@@ -92,6 +92,7 @@ enum class global_topology_request: uint16_t {
     finalize_migration,
     quiesce,
     restore_tablets,
+    upload_tablets,
 };
 
 struct ring_slice {
@@ -225,6 +226,7 @@ struct topology {
     // restore_tablets requests inside handle_tablet_migration() so they can be
     // absorbed into an existing tablet_migration round.
     std::unordered_set<utils::UUID> ongoing_restore_requests;
+    std::unordered_set<utils::UUID> ongoing_upload_requests;
 
     // The IDs of the committed yet unpublished CDC generations sorted by timestamps.
     std::vector<cdc::generation_id> unpublished_cdc_generations;

@@ -6023,6 +6023,10 @@ future<> storage_service::del_tablet_replica(table_id table, dht::token token, l
     });
 }
 
+bool storage_service::is_upload_request_ongoing(utils::UUID request_id) const {
+    return _topology_state_machine._topology.ongoing_upload_requests.contains(request_id);
+}
+
 future<> storage_service::abort_restore_tablets(table_id table) {
     auto holder = _async_gate.hold();
 

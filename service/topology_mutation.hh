@@ -136,6 +136,8 @@ public:
     topology_mutation_builder& finish_rf_change_migrations(const std::unordered_set<utils::UUID>&, const utils::UUID&);
     topology_mutation_builder& start_restore_request(const utils::UUID& req_id);
     topology_mutation_builder& finish_restore_request(const std::unordered_set<utils::UUID>& current, const utils::UUID& req_id);
+    topology_mutation_builder& start_upload_request(const utils::UUID& req_id);
+    topology_mutation_builder& finish_upload_requests(const std::unordered_set<utils::UUID>& current, const std::unordered_set<utils::UUID>& finished);
     topology_node_mutation_builder& with_node(raft::server_id);
     canonical_mutation build() { return canonical_mutation{std::move(_m)}; }
 };
@@ -167,6 +169,7 @@ public:
     topology_request_tracking_mutation_builder& set_snapshot_tables_data(const std::unordered_set<table_id>&, const sstring& tag, bool);
     topology_request_tracking_mutation_builder& set_finalize_migration_data(const sstring& ks_name);
     topology_request_tracking_mutation_builder& set_restore_tablets_data(const table_id& tid, const sstring& snapshot_name);
+    topology_request_tracking_mutation_builder& set_upload_tablets_data(const table_id& tid, bool primary_replica_only);
 
     canonical_mutation build() { return canonical_mutation{std::move(_m)}; }
 };

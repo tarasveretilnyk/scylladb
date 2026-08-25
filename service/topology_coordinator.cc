@@ -1468,6 +1468,10 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             co_await _group0.client().add_entry(std::move(g0_cmd), std::move(guard), _as);
         }
         break;
+        case global_topology_request::upload_tablets: {
+            // Nothing queues this yet; the coordinator learns to prepare the work later.
+            break;
+        }
         case global_topology_request::restore_tablets: {
             rtlogger.info("restore_tablets requested");
 

@@ -991,6 +991,8 @@ public:
     future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> restore_tablets(table_id, sstring snap_name);
     future<> abort_restore_tablets(table_id);
+    // Shard 0 only. Whether the request is in ongoing_upload_requests as of the applied group0 state.
+    bool is_upload_request_ongoing(utils::UUID request_id) const;
     future<> set_tablet_balancing_enabled(bool);
 
     future<utils::UUID> submit_quiesce_topology_request();
