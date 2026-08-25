@@ -226,8 +226,8 @@ distributed_loader::process_upload_dir(sharded<replica::database>& db, sharded<d
 }
 
 future<std::tuple<table_id, std::vector<std::vector<sstables::shared_sstable>>>>
-distributed_loader::get_sstables_from_upload_dir(sharded<replica::database>& db, sstring ks, sstring cf, sstables::sstable_open_config cfg) {
-    bool need_mutate_level = true;
+distributed_loader::get_sstables_from_upload_dir(sharded<replica::database>& db, sstring ks, sstring cf, sstables::sstable_open_config cfg,
+        bool need_mutate_level) {
     return get_sstables_from(db, ks, cf, cfg, [] (auto& global_table, auto& directory) {
         return directory.start(global_table.as_sharded_parameter(),
             sstables::sstable_state::upload, &error_handler_gen_for_upload_dir
