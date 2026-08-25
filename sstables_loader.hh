@@ -30,6 +30,37 @@ struct minimal_sst_info;
 struct restore_result {
 };
 
+/// One node's upload-directory work for a single tablet, as measured by PREPARE_UPLOAD.
+/// shards are the node's shards holding sstables which overlap the tablet - an sstable can
+/// only be read by the shard which opened it, so the set travels with the work.
+struct upload_work_item {
+    uint64_t tablet_id = 0;
+    std::vector<uint32_t> shards;
+    // Bytes each entry of shards contributes, in the same order. Charging every shard the
+    // tablet total would throttle a load by the shard count.
+    std::vector<uint64_t> shard_bytes;
+    // Estimate; see sstable::estimated_data_size_for_range().
+    uint64_t estimated_bytes = 0;
+};
+
+struct upload_tablet_result {
+};
+
+struct finish_upload_result {
+};
+
+struct upload_replicate_result {
+};
+
+struct upload_stream_session_result {
+};
+
+struct prepare_upload_response {
+    std::vector<upload_work_item> items;
+    uint64_t total_estimated_bytes = 0;
+    uint32_t sstable_count = 0;
+};
+
 namespace sstables { class storage_manager; }
 
 namespace netw { class messaging_service; }
