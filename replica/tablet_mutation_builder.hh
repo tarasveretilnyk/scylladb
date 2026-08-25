@@ -52,6 +52,8 @@ public:
     tablet_mutation_builder& set_base_table(table_id base_table);
     tablet_mutation_builder& set_snapshot_name(dht::token last_token, sstring snapshot_name);
     tablet_mutation_builder& del_snapshot_name(dht::token last_token);
+    tablet_mutation_builder& set_upload_info(dht::token last_token, const locator::tablet_upload_info&);
+    tablet_mutation_builder& del_upload_info(dht::token last_token);
 
 
     bool empty() const {

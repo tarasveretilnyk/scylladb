@@ -95,7 +95,12 @@ schema_ptr make_tablets_schema() {
             .with_column("migration_task_info", tablet_task_info_type)
             .with_column("resize_task_info", tablet_task_info_type, column_kind::static_column)
             .with_column("base_table", uuid_type, column_kind::static_column)
-            .with_column("snapshot_name", utf8_type);
+            .with_column("snapshot_name", utf8_type)
+            .with_column("upload_source_host", uuid_type)
+            .with_column("upload_source_shards", list_type_impl::get_instance(int32_type, false))
+            // Replica this transition streams into; upload_tablet_state holds the request choice.
+            .with_column("upload_target_host", uuid_type)
+            .with_column("upload_request_id", timeuuid_type);
 
     if (strongly_consistent_tables_enabled) {
         builder
@@ -505,6 +510,35 @@ tablet_mutation_builder::del_snapshot_name(dht::token last_token) {
 }
 
 tablet_mutation_builder&
+tablet_mutation_builder::set_upload_info(dht::token last_token, const locator::tablet_upload_info& info) {
+    auto ck = get_ck(last_token);
+    _m.set_clustered_cell(ck, "upload_source_host", data_value(info.source_host.uuid()), _ts);
+    auto shard_list_type = list_type_impl::get_instance(int32_type, false);
+    std::vector<data_value> shard_values;
+    shard_values.reserve(info.source_shards.size());
+    for (auto s : info.source_shards) {
+        shard_values.emplace_back(int32_t(s));
+    }
+    _m.set_clustered_cell(ck, "upload_source_shards",
+            make_list_value(shard_list_type, std::move(shard_values)), _ts);
+    _m.set_clustered_cell(ck, "upload_target_host", data_value(info.primary_host.uuid()), _ts);
+    _m.set_clustered_cell(ck, "upload_request_id", data_value(info.request_id), _ts);
+    return *this;
+}
+
+tablet_mutation_builder&
+tablet_mutation_builder::del_upload_info(dht::token last_token) {
+    auto ck = get_ck(last_token);
+    for (const char* name : {"upload_source_host", "upload_source_shards",
+                             "upload_target_host", "upload_request_id"}) {
+        auto col = _s->get_column_definition(name);
+        _m.set_clustered_cell(ck, *col, atomic_cell::make_dead(_ts, gc_clock::now()));
+    }
+    return *this;
+}
+
+
+tablet_mutation_builder&
 tablet_mutation_builder::set_migration_task_info(dht::token last_token, locator::tablet_task_info migration_task_info, const gms::feature_service& features) {
     if (features.tablet_migration_virtual_task) {
         _m.set_clustered_cell(get_ck(last_token), "migration_task_info", tablet_task_info_to_data_value(migration_task_info), _ts);
@@ -833,8 +867,26 @@ tablet_id process_one_row(replica::database* db, table_id table, tablet_map& map
         if (row.has("session")) {
             session_id = service::session_id(row.get_as<utils::UUID>("session"));
         }
+        std::optional<locator::tablet_upload_info> upload_info;
+        if (row.has("upload_source_host")) {
+            utils::small_vector<shard_id, 4> source_shards;
+            if (row.has("upload_source_shards")) {
+                for (auto s : row.get_list<int32_t>("upload_source_shards")) {
+                    source_shards.push_back(shard_id(s));
+                }
+            }
+            upload_info = locator::tablet_upload_info{
+                .source_host = locator::host_id(row.get_as<utils::UUID>("upload_source_host")),
+                .source_shards = std::move(source_shards),
+                .primary_host = row.has("upload_target_host")
+                        ? locator::host_id(row.get_as<utils::UUID>("upload_target_host")) : locator::host_id{},
+                .request_id = row.has("upload_request_id")
+                        ? row.get_as<utils::UUID>("upload_request_id") : utils::UUID{},
+            };
+        }
         map.set_tablet_transition_info(tid, tablet_transition_info{stage, transition,
-                std::move(new_tablet_replicas), pending_replica, session_id, std::move(snapshot_name)});
+                std::move(new_tablet_replicas), pending_replica, session_id, std::move(snapshot_name),
+                std::move(upload_info)});
     }
 
     tablet_logger.debug("Set sstables_repaired_at={} table={} tablet={}", sstables_repaired_at, table, tid);
