@@ -3548,7 +3548,9 @@ bool has_size_on_leaving (locator::tablet_transition_stage stage) {
         case locator::tablet_transition_stage::rebuild_repair:                          [[fallthrough]];
         case locator::tablet_transition_stage::repair:                                  [[fallthrough]];
         case locator::tablet_transition_stage::end_repair:                              [[fallthrough]];
-        case locator::tablet_transition_stage::restore:
+        case locator::tablet_transition_stage::restore:                                 [[fallthrough]];
+        case locator::tablet_transition_stage::upload:                                  [[fallthrough]];
+        case locator::tablet_transition_stage::upload_replicate:
             return true;
         case locator::tablet_transition_stage::cleanup:                                 [[fallthrough]];
         case locator::tablet_transition_stage::end_migration:
@@ -3572,7 +3574,9 @@ bool has_size_on_pending (locator::tablet_transition_stage stage) {
         case locator::tablet_transition_stage::end_migration:                           [[fallthrough]];
         case locator::tablet_transition_stage::repair:                                  [[fallthrough]];
         case locator::tablet_transition_stage::end_repair:                              [[fallthrough]];
-        case locator::tablet_transition_stage::restore:
+        case locator::tablet_transition_stage::restore:                                 [[fallthrough]];
+        case locator::tablet_transition_stage::upload:                                  [[fallthrough]];
+        case locator::tablet_transition_stage::upload_replicate:
             return true;
     }
 }

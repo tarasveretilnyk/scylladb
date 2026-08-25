@@ -372,6 +372,8 @@ enum class tablet_transition_stage {
     repair,
     end_repair,
     restore,
+    upload,
+    upload_replicate,
 };
 
 enum class tablet_transition_kind {
@@ -397,6 +399,12 @@ enum class tablet_transition_kind {
 
     // Download sstables for tablet
     restore,
+
+    // Stream a slice of a source node's upload directory into the tablet's primary replica.
+    upload,
+
+    // Copy an uploaded tablet from its primary replica to the rest; not used in primary-only mode.
+    upload_replicate,
 };
 
 tablet_transition_kind choose_rebuild_transition_kind(const gms::feature_service& features);
@@ -412,6 +420,25 @@ enum class read_replica_set_selector {
     previous, next
 };
 
+/// Endpoints of an upload transition. For upload, source_host holds the upload directory and
+/// source_shards its shards with overlapping sstables; one transition covers all of them, and
+/// they are recorded rather than derived because only the opening shard can read an sstable.
+/// The receiving shard is not named: STREAM_BLOB writes wherever the connection lands and the
+/// mutation path re-shards by token, so the owning shard is derived at the point of use and a
+/// tablet migrating mid-upload is still attached where it lives. For upload_replicate,
+/// source_host/source_shard are the primary replica the remaining replicas come from.
+struct tablet_upload_info {
+    locator::host_id source_host;
+    utils::small_vector<shard_id, 4> source_shards;
+    // Replica the data is streamed into; phase 1 targets it alone, enabling phase 2's file copy.
+    locator::host_id primary_host;
+    // Request this transition belongs to. Carried explicitly rather than taken from the session:
+    // when the coordinator moves its session closes, and transitions naming it fail permanently.
+    utils::UUID request_id;
+
+    bool operator==(const tablet_upload_info&) const = default;
+};
+
 /// Used for storing tablet state transition during topology changes.
 /// Describes transition of a single tablet.
 struct tablet_transition_info {
@@ -421,6 +448,7 @@ struct tablet_transition_info {
     std::optional<tablet_replica> pending_replica; // Optimization (next - tablet_info::replicas)
     service::session_id session_id;
     sstring snapshot_name;
+    std::optional<tablet_upload_info> upload_info; // Set iff transition is upload or upload_replicate.
     write_replica_set_selector writes;
     read_replica_set_selector reads;
 
@@ -429,7 +457,8 @@ struct tablet_transition_info {
                            tablet_replica_set next,
                            std::optional<tablet_replica> pending_replica,
                            service::session_id session_id = {},
-                           sstring snapshot_name = {});
+                           sstring snapshot_name = {},
+                           std::optional<tablet_upload_info> upload_info = std::nullopt);
 
     bool operator==(const tablet_transition_info&) const = default;
 };
@@ -461,6 +490,7 @@ tablet_transition_info migration_to_transition_info(const tablet_info&, const ta
 constexpr int tablet_migration_stream_weight_default = 1;
 constexpr int tablet_migration_stream_weight_repair = 2;
 constexpr int tablet_migration_stream_weight_restore = 2;
+constexpr int tablet_migration_stream_weight_upload = 1;
 struct tablet_migration_streaming_info {
     std::unordered_set<tablet_replica> read_from;
     std::unordered_set<tablet_replica> written_to;
@@ -468,6 +498,10 @@ struct tablet_migration_streaming_info {
     // more work than just moving the tablet around. The stream_weight for all
     // other migrations are set to 1.
     int stream_weight = tablet_migration_stream_weight_default;
+    // Cluster upload has a budget of its own (bytes in flight per shard, see
+    // tablet_upload_batch_size_in_mb); on the count-based limit it would park a shard above
+    // tablet_streaming_write_concurrency_per_shard and block every migration there for the load.
+    bool is_upload = false;
 };
 
 tablet_migration_streaming_info get_migration_streaming_info(const locator::topology&, const tablet_info&, const tablet_transition_info&);

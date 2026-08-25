@@ -2542,6 +2542,11 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     }
                 }
                     break;
+                case locator::tablet_transition_stage::upload:
+                    [[fallthrough]];
+                case locator::tablet_transition_stage::upload_replicate:
+                    // Nothing creates these yet; the handlers arrive with the executor.
+                    break;
                 case locator::tablet_transition_stage::restore: {
                     if (trinfo.snapshot_name.empty()) {
                         on_internal_error(rtlogger, format("Cannot handle restore transition without snapshot name for tablet {}", gid));
@@ -2768,6 +2773,10 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             case locator::tablet_transition_kind::repair:
                 [[fallthrough]];
             case locator::tablet_transition_kind::restore:
+                [[fallthrough]];
+            case locator::tablet_transition_kind::upload:
+                [[fallthrough]];
+            case locator::tablet_transition_kind::upload_replicate:
                 [[fallthrough]];
             case locator::tablet_transition_kind::intranode_migration:
                 break;

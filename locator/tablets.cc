@@ -133,6 +133,10 @@ write_replica_set_selector get_selector_for_writes(tablet_transition_stage stage
             return write_replica_set_selector::next;
         case tablet_transition_stage::restore:
             return write_replica_set_selector::previous;
+        case tablet_transition_stage::upload:
+            return write_replica_set_selector::previous;
+        case tablet_transition_stage::upload_replicate:
+            return write_replica_set_selector::previous;
     }
     on_internal_error(tablet_logger, format("Invalid tablet transition stage: {}", static_cast<int>(stage)));
 }
@@ -168,6 +172,10 @@ read_replica_set_selector get_selector_for_reads(tablet_transition_stage stage) 
             return read_replica_set_selector::next;
         case tablet_transition_stage::restore:
             return read_replica_set_selector::previous;
+        case tablet_transition_stage::upload:
+            return read_replica_set_selector::previous;
+        case tablet_transition_stage::upload_replicate:
+            return read_replica_set_selector::previous;
     }
     on_internal_error(tablet_logger, format("Invalid tablet transition stage: {}", static_cast<int>(stage)));
 }
@@ -177,13 +185,15 @@ tablet_transition_info::tablet_transition_info(tablet_transition_stage stage,
                                                tablet_replica_set next,
                                                std::optional<tablet_replica> pending_replica,
                                                service::session_id session_id,
-                                               sstring snapshot_name)
+                                               sstring snapshot_name,
+                                               std::optional<tablet_upload_info> upload_info)
     : stage(stage)
     , transition(transition)
     , next(std::move(next))
     , pending_replica(std::move(pending_replica))
     , session_id(session_id)
     , snapshot_name(std::move(snapshot_name))
+    , upload_info(std::move(upload_info))
     , writes(get_selector_for_writes(stage))
     , reads(get_selector_for_reads(stage))
 { }
@@ -243,6 +253,46 @@ tablet_migration_streaming_info get_migration_streaming_info(const locator::topo
             result.stream_weight = locator::tablet_migration_stream_weight_restore;
             result.read_from = s;
             result.written_to = std::move(s);
+            return result;
+        }
+        case tablet_transition_kind::upload: {
+            // Reads happen on the source shards that opened the slice; one transition covers them.
+            if (!trinfo.upload_info) {
+                on_internal_error(tablet_logger, "upload transition without upload_info");
+            }
+            auto& ui = *trinfo.upload_info;
+            result.stream_weight = locator::tablet_migration_stream_weight_upload;
+            result.is_upload = true;
+            for (auto s : ui.source_shards) {
+                result.read_from.insert(tablet_replica{ui.source_host, s});
+            }
+            // Writing lands on the primary replica alone; upload_replicate populates the rest.
+            // Charging the whole replica set would put phantom write load on RF-1 shards and, at
+            // tablet_streaming_write_concurrency_per_shard, block migrations to them. Charged to
+            // the primary's owning shard, since the file bytes land wherever the connection did.
+            for (auto&& r : tinfo.replicas) {
+                if (r.host == ui.primary_host) {
+                    result.written_to.insert(r);
+                }
+            }
+            return result;
+        }
+        case tablet_transition_kind::upload_replicate: {
+            if (!trinfo.upload_info) {
+                on_internal_error(tablet_logger, "upload_replicate transition without upload_info");
+            }
+            auto& ui = *trinfo.upload_info;
+            // Phase 2 reads from the primary: source_shards carries it as its only element.
+            auto src = tablet_replica{ui.source_host,
+                    ui.source_shards.empty() ? shard_id(0) : ui.source_shards.front()};
+            result.stream_weight = locator::tablet_migration_stream_weight_upload;
+            result.is_upload = true;
+            result.read_from.insert(src);
+            for (auto&& r : tinfo.replicas) {
+                if (r.host != src.host) {
+                    result.written_to.insert(r);
+                }
+            }
             return result;
         }
     }
@@ -960,6 +1010,8 @@ static const std::unordered_map<tablet_transition_stage, sstring> tablet_transit
     {tablet_transition_stage::revert_migration, "revert_migration"},
     {tablet_transition_stage::end_migration, "end_migration"},
     {tablet_transition_stage::restore, "restore"},
+    {tablet_transition_stage::upload, "upload"},
+    {tablet_transition_stage::upload_replicate, "upload_replicate"},
 };
 
 static const std::unordered_map<sstring, tablet_transition_stage> tablet_transition_stage_from_name = std::invoke([] {
@@ -994,6 +1046,8 @@ static const std::unordered_map<tablet_transition_kind, sstring> tablet_transiti
         {tablet_transition_kind::rebuild_v2, "rebuild_v2"},
         {tablet_transition_kind::repair, "repair"},
         {tablet_transition_kind::restore, "restore"},
+        {tablet_transition_kind::upload, "upload"},
+        {tablet_transition_kind::upload_replicate, "upload_replicate"},
 };
 
 static const std::unordered_map<sstring, tablet_transition_kind> tablet_transition_kind_from_name = std::invoke([] {
@@ -1295,6 +1349,10 @@ std::optional<uint64_t> load_stats::get_tablet_size_in_transition(host_id host, 
             case tablet_transition_kind::intranode_migration:
                 [[fallthrough]];
             case tablet_transition_kind::restore:
+                [[fallthrough]];
+            case tablet_transition_kind::upload:
+                [[fallthrough]];
+            case tablet_transition_kind::upload_replicate:
                 [[fallthrough]];
             case tablet_transition_kind::repair:
                 break;
