@@ -2034,6 +2034,60 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             .set_session(last_token, session_id(utils::UUID_gen::get_time_UUID()));
     }
 
+    void generate_upload_update(tablet_builder_map& builders, const group0_guard& guard,
+            const upload_work_assignment& a) {
+        auto request_id = a.request_id;
+        auto& tmap = get_token_metadata_ptr()->tablets().get_tablet_map(a.tablet.table);
+        auto last_token = tmap.get_last_token(a.tablet.tablet);
+        if (tmap.get_tablet_transition_info(a.tablet.tablet)) {
+            rtlogger.warn("Tablet already in transition, ignoring upload: {}", a.tablet);
+            return;
+        }
+        // The session is the request id, so the executor can find the directory it opened.
+        get_tablet_builder(builders, guard, a.tablet.table)
+            .set_new_replicas(last_token, tmap.get_tablet_info(a.tablet.tablet).replicas)
+            .set_stage(last_token, locator::tablet_transition_stage::upload)
+            .set_transition(last_token, locator::tablet_transition_kind::upload)
+            .set_upload_info(last_token, locator::tablet_upload_info{
+                .source_host = a.source_host,
+                .source_shards = a.source_shards,
+                .primary_host = a.primary_host,
+                .request_id = request_id,
+            })
+            // A session of its own: a session belongs to the coordinator that opened it, so
+            // reusing the request's wedged every transition once the coordinator moved.
+            .set_session(last_token, session_id(utils::UUID_gen::get_time_UUID()));
+    }
+
+    void generate_upload_replicate_update(tablet_builder_map& builders, const group0_guard& guard,
+            const upload_replicate_assignment& a) {
+        auto request_id = a.request_id;
+        auto& tmap = get_token_metadata_ptr()->tablets().get_tablet_map(a.tablet.table);
+        auto last_token = tmap.get_last_token(a.tablet.tablet);
+        if (tmap.get_tablet_transition_info(a.tablet.tablet)) {
+            rtlogger.warn("Tablet already in transition, ignoring upload replicate: {}", a.tablet);
+            return;
+        }
+        auto& tinfo = tmap.get_tablet_info(a.tablet.tablet);
+        auto primary_shard = std::ranges::find_if(tinfo.replicas, [&] (auto& r) { return r.host == a.primary_host; });
+        if (primary_shard == tinfo.replicas.end()) {
+            rtlogger.warn("Primary {} is no longer a replica of {}, skipping replication", a.primary_host, a.tablet);
+            return;
+        }
+        get_tablet_builder(builders, guard, a.tablet.table)
+            .set_new_replicas(last_token, tinfo.replicas)
+            .set_stage(last_token, locator::tablet_transition_stage::upload_replicate)
+            .set_transition(last_token, locator::tablet_transition_kind::upload_replicate)
+            .set_upload_info(last_token, locator::tablet_upload_info{
+                .source_host = a.primary_host,
+                .source_shards = {primary_shard->shard},
+                .primary_host = a.primary_host,
+                .request_id = request_id,
+            })
+            // A session of its own: by phase 2 the request's session has been closed.
+            .set_session(last_token, session_id(utils::UUID_gen::get_time_UUID()));
+    }
+
     void generate_resize_update(group0_update_collector& out, const group0_guard& guard, table_id table_id, locator::resize_decision resize_decision) {
             // FIXME: indent.
             auto s = _db.find_schema(table_id);
@@ -2182,6 +2236,34 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         for (const auto& gid : plan.repair_plan().repairs()) {
             co_await coroutine::maybe_yield();
             generate_repair_update(migration_builders, guard, gid, sched_time);
+        }
+
+        // Must cover replicates too: phase 2 is only scheduled once phase-1 work is exhausted.
+        // The assignments carry their request id, so nothing needs re-reading here.
+        for (const auto& a : plan.upload_plan().uploads()) {
+            co_await coroutine::maybe_yield();
+            generate_upload_update(migration_builders, guard, a);
+        }
+        for (const auto& a : plan.upload_plan().replicates()) {
+            co_await coroutine::maybe_yield();
+            generate_upload_replicate_update(migration_builders, guard, a);
+        }
+
+        if (!plan.upload_plan().phase_changes().empty()) {
+            std::unordered_map<utils::UUID, upload_tablet_state_mutation_builder> state_builders;
+            for (const auto& c : plan.upload_plan().phase_changes()) {
+                co_await coroutine::maybe_yield();
+                auto [it, _] = state_builders.try_emplace(c.request_id, guard.write_timestamp(), c.request_id);
+                it->second.set_phase(c.tablet_id, c.phase);
+                if (c.assign_primary) {
+                    it->second.set_primary_host(c.tablet_id, *c.assign_primary);
+                }
+            }
+            for (auto& [req_id, builder] : state_builders) {
+                if (!builder.empty()) {
+                    out.emplace_back(canonical_mutation(builder.build()));
+                }
+            }
         }
 
         co_await flush_tablet_builders(out, migration_builders);
