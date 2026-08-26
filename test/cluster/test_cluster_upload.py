@@ -752,6 +752,93 @@ async def test_cluster_upload_abort(manager: ScyllaClusterManager):
         await wait_for_upload_dirs_empty(saved)
 
 
+@pytest.mark.asyncio
+async def test_cluster_upload_abort_interrupts_streaming(manager: ScyllaClusterManager):
+    """Aborting must stop a transfer that is already under way, not only stop new ones.
+
+    The executor holds a session_topology_guard, and clearing the transition's session fires
+    its abort source. That was inert for a while: the guard was constructed and the abort
+    source never consulted, so a transfer already started ran to completion and the abort
+    only took effect at the next transition boundary. It is now checked before each file and
+    between chunks on the file path, and per fragment on the mutation path.
+
+    The sibling abort test cannot show this - it accepts termination however it arrives. Here
+    the transition is parked before it picks a transport, aborted while parked, and then
+    released: the first check after the injection lets go has to fail it, so the abort has to
+    appear in the log as a torn-down stream rather than as a tablet that simply finished.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    # RF=3 so phase 1 has somewhere to stream to; at RF=1 nothing goes on the wire to interrupt.
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        injection = "upload_tablet_before_transport"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
+
+        tid = await table_id_of(cql, ks, cf)
+        logs = [await manager.server_open_log(s.server_id) for s in servers]
+        marks = [await lg.mark() for lg in logs]
+
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180))
+
+        async def transitions_parked():
+            rows = await cql.run_async(f"SELECT stage FROM system.tablets WHERE table_id = {tid}")
+            return True if sum(1 for r in rows if r.stage == 'upload') > 0 else None
+
+        releaser = None
+        try:
+            await wait_for(transitions_parked, time.time() + 60, period=0.1)
+
+            # Abort while transfers are held: each session is closed, so its abort source has fired.
+            await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
+
+            async def release():
+                while True:
+                    for s in servers:
+                        try:
+                            await manager.api.message_injection(s.ip_addr, injection)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.05)
+
+            releaser = asyncio.create_task(release())
+
+            try:
+                await upload
+            except Exception as e:
+                logger.info(f"upload ended with {e!r} after abort, which is expected")
+
+            aborted = []
+            for lg, mk in zip(logs, marks):
+                aborted += await lg.grep(r"Upload of tablet .* was aborted|"
+                                         r"abort requested|"
+                                         r"Master failed sending file|"
+                                         r"send_phase, err", from_mark=mk)
+            assert aborted, ("no transfer reported being interrupted; the abort took effect "
+                             "only between transitions, so the abort source is not being checked")
+        finally:
+            if releaser:
+                releaser.cancel()
+            for s in servers:
+                try:
+                    await manager.api.disable_injection(s.ip_addr, injection)
+                except Exception:
+                    pass
+
+
 async def view_row_count(cql, ks, view):
     rows = await cql.run_async(f"SELECT COUNT(*) AS c FROM {ks}.{view}")
     return rows[0].c

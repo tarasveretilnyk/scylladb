@@ -1293,10 +1293,13 @@ future<size_t> sstables_loader::attach_local_upload_sstables(locator::global_tab
 // counters - the same caveat the streaming path carries.
 future<size_t> sstables_loader::combine_local_upload_sstables(locator::global_tablet_id gid,
         shard_id owning_shard, const dht::token_range& tablet_range,
-        std::vector<sstables::shared_sstable>& partially_contained, upload_session& session) {
+        std::vector<sstables::shared_sstable>& partially_contained, upload_session& session,
+        seastar::abort_source& as) {
     if (partially_contained.empty()) {
         co_return 0;
     }
+    as.check();
+    auto attach_hold = session.attach_gate.hold();
     auto& tbl = _db.local().find_column_family(gid.table);
     auto s = tbl.schema();
 
@@ -1382,6 +1385,15 @@ future<size_t> sstables_loader::combine_local_upload_sstables(locator::global_ta
     if (ex) {
         co_await sst->unlink();
         co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+
+    // The last point at which the result can still be discarded. An abort promises that what was
+    // not consumed stays in the upload directory.
+    if (as.abort_requested()) {
+        llog.info("Discarding the combined sstable of tablet {} on shard {}: the request was "
+                "aborted while it was being written", gid, this_shard_id());
+        co_await sst->unlink();
+        throw seastar::abort_requested_exception();
     }
 
     auto taken = partially_contained.size();
@@ -1675,7 +1687,8 @@ future<> sstables_loader::stream_tablet_from_upload_dir(locator::global_tablet_i
             llog.debug("Attached {} fully contained sstables locally for tablet {}", taken, gid);
         }
         if (!partially.empty()) {
-            co_await combine_local_upload_sstables(gid, primary_shard, tablet_range, partially, *session);
+            co_await combine_local_upload_sstables(gid, primary_shard, tablet_range, partially, *session,
+                    session_guard.abort_source());
         }
     }
 

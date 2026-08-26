@@ -222,7 +222,8 @@ private:
     // whether to start one and whether to attach a finished one.
     future<size_t> combine_local_upload_sstables(locator::global_tablet_id, shard_id owning_shard,
             const dht::token_range& tablet_range,
-            std::vector<sstables::shared_sstable>& partially_contained, upload_session& session);
+            std::vector<sstables::shared_sstable>& partially_contained, upload_session& session,
+            seastar::abort_source& as);
     future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);
     future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
 
