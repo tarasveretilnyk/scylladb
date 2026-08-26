@@ -347,7 +347,7 @@ async def test_cluster_upload_load_is_not_charged_to_the_migration_budget(manage
 
 
 @pytest.mark.asyncio
-async def test_cluster_upload_fails_when_a_source_node_is_removed(manager: ManagerClient):
+async def test_cluster_upload_fails_when_a_source_node_is_removed(manager: ScyllaClusterManager):
     """A source node leaving with work outstanding must fail the request, naming the node.
 
     Its share of the upload directory is gone with it, so the load cannot be completed and
@@ -392,14 +392,11 @@ async def test_cluster_upload_fails_when_a_source_node_is_removed(manager: Manag
         try:
             await wait_for(work_exists, time.time() + 60, period=0.1)
 
-            # Killed rather than stopped gracefully: it is parked inside the injection, so a
-            # graceful shutdown has nothing to drain into and would abort on the shutdown
-            # timeout. Its work stays outstanding because it is no longer there to stream it.
+            # Killed, not stopped: parked in the injection it would abort on the shutdown timeout.
             await manager.server_stop(victim.server_id, convict=True)
 
-            # The survivors have to be let go before the node is removed. Their parked
-            # transitions each hold a session guard, and removenode waits on a barrier that
-            # those guards block - the operation would hang rather than proceed.
+            # Survivors must be let go before the node is removed: their parked transitions hold
+            # session guards, and removenode waits on a barrier those guards block.
             for s in servers[:2]:
                 await manager.api.disable_injection(s.ip_addr, injection)
                 try:
