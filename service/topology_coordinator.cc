@@ -2981,16 +2981,10 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
                     if (action_failed(tablet_state.upload)) {
                         auto ep = tablet_state.upload->get_exception();
-                        rtlogger.debug("Clearing upload transition for {} due to error", gid);
+                        // Logged, not recorded as the request's outcome: this failure is
+                        // retryable - the work row stays and the scheduler retries the slice.
+                        rtlogger.warn("Upload of tablet {} failed, will retry: {}", gid, ep);
                         clear_upload_transition();
-                        // Leave the work row in place. Clearing only the transition lets the
-                        // scheduler retry this slice, possibly from another source node, and
-                        // an upload that keeps failing surfaces as a stalled request rather
-                        // than as silently dropped data.
-                        updates.add(
-                            topology_request_tracking_mutation_builder(request_id)
-                                .set("error", format("Upload failed for tablet {}: {}", gid, ep))
-                                .build());
                         break;
                     }
 
@@ -3048,13 +3042,6 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         // done would report success with the data still only on the primary.
                         rtlogger.warn("Upload replication of tablet {} failed, will retry: {}", gid, ep);
                         clear_upload_transition();
-                        // The phase stays at replicating, so the scheduler retries after its
-                        // backoff. Marking it done here would leave the data on the primary
-                        // alone while reporting success.
-                        updates.add(
-                            topology_request_tracking_mutation_builder(request_id)
-                                .set("error", format("Upload replication failed for tablet {}: {}", gid, ep))
-                                .build());
                         break;
                     }
 

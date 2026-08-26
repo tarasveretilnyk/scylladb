@@ -1504,6 +1504,10 @@ future<upload_replicate_result> sstables_loader::do_upload_replicate_tablet(loca
             tablet_range = tmap.get_token_range(gid.tablet);
         }
 
+        utils::get_local_injector().inject("upload_replicate_fail", [] {
+            throw std::runtime_error("Injected upload_replicate failure");
+        });
+
         service::session_topology_guard session_guard(session_id);
         auto& tbl = _db.local().find_column_family(gid.table);
         auto stream_guard = tbl.stream_in_progress();

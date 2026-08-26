@@ -818,7 +818,7 @@ async def test_cluster_upload_replicates_to_all_replicas(manager: ScyllaClusterM
 
 
 @pytest.mark.asyncio
-async def test_cluster_upload_retries_failed_replication(manager: ManagerClient):
+async def test_cluster_upload_retries_failed_replication(manager: ScyllaClusterManager):
     """A failed phase-2 replication must be retried until the data reaches every replica.
 
     Phase 2 failing clears the transition but leaves the tablet in the replicating phase, so
@@ -846,8 +846,7 @@ async def test_cluster_upload_retries_failed_replication(manager: ManagerClient)
         await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
         await plant_upload_dirs(saved)
 
-        # One shot per node: each fails its first replication and then lets the rest through,
-        # so the load has to recover rather than being blocked outright.
+        # One shot per node: each fails its first replication, so the load must recover.
         injection = "upload_replicate_fail"
         for s in servers:
             await manager.api.enable_injection(s.ip_addr, injection, one_shot=True)
@@ -857,7 +856,6 @@ async def test_cluster_upload_retries_failed_replication(manager: ManagerClient)
 
         await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=240)
 
-        # The failure has to have actually happened, or the retry was never exercised.
         failed = []
         for lg, mk in zip(logs, marks):
             failed += await lg.grep("Injected upload_replicate failure", from_mark=mk)
@@ -866,9 +864,6 @@ async def test_cluster_upload_retries_failed_replication(manager: ManagerClient)
         got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
         assert got == {str(k) for k in range(KEYS)}
 
-        # Every tablet left the replicating phase, so each retried replication completed. Had
-        # the retry not run, the request could not have finished at all - which is the other
-        # half of the assertion, since the wait above returned.
         leftover = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
         assert not leftover, f"{len(leftover)} tablets still replicating after completion"
 
