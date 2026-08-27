@@ -24,11 +24,11 @@ import pytest
 from cassandra.cluster import ConsistencyLevel
 
 from test.cluster.util import (get_topology_coordinator, new_test_keyspace,
-                               trigger_snapshot, trigger_stepdown)
+                               trigger_snapshot)
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.rest_client import HTTPError, read_barrier
 from test.pylib.tablets import get_base_table
-from test.pylib.util import wait_for
+from test.pylib.util import wait_for, wait_for_cql_and_get_hosts
 
 logger = logging.getLogger(__name__)
 
@@ -1838,34 +1838,97 @@ async def dc1_replicated_servers(manager):
     ])
 
 
-async def drive_coordinator_to(manager, live, target_host, deadline):
-    """Step down whoever leads until `target_host` does, then return; assert it got there in time.
+@pytest.mark.asyncio
+async def test_cluster_upload_state_survives_raft_snapshot(manager: ScyllaClusterManager):
+    """A node that joins via a raft snapshot must receive the upload work tables.
 
-    Raft will not hand leadership to a chosen node, so this repeatedly steps the current leader
-    down and re-reads who won until the target does. `live` is every node that can answer a
-    leader probe, the target included; probes tolerate failure because an election may be in
-    progress and a stale node can answer 500. get_topology_coordinator() is avoided for the same
-    reason: it takes a read barrier through whichever host the driver offers.
+    The request lives in system.topology and system.topology_requests, but the work itself
+    lives in system.upload_work and system.upload_tablet_state - and those were missing from
+    the snapshot transfer. A node that joined mid-upload therefore saw the request and none of
+    its work, so on becoming coordinator it read an empty work list, concluded the load had
+    finished, reported success and told every node to delete what it had consumed.
+
+    The sibling restart test cannot catch this: a node that was in the cluster all along has
+    the tables from log replay. Only a node that joined by snapshot does - hence
+    trigger_snapshot before the join, and the assertions read the new node's own replica of
+    the tables. The stronger form of this test - forcing the joiner to take over as
+    coordinator and finish the load - was dropped: raft transfers leadership to the first
+    caught-up voter it finds, a fixed per-run cycle that no amount of blind stepdowns steers
+    to a chosen node, and steering it deterministically needs core raft support that is not
+    worth adding for a test.
+
+    The joining node lives in dc2, which replicates none of the keyspace, so its only copy of
+    the work can have come from group0, not from data streaming.
     """
-    while True:
-        current = None
-        for probe in live:
-            try:
-                current = await manager.api.get_raft_leader(probe.ip_addr)
-                break
-            except Exception as e:
-                logger.info(f"leader probe via {probe.ip_addr} failed: {e!r}")
-        if current is not None and str(current) == str(target_host):
-            logger.info(f"coordinator is now {current}")
-            return
-        assert time.time() < deadline, (
-            f"the coordinator never moved to {target_host} (it is {current}), so this run "
-            f"did not exercise the snapshot transfer")
-        if current is not None:
-            try:
-                loser = await manager.find_server_by_host_id(live, current)
-                logger.info(f"coordinator is {current}, stepping it down to reach {target_host}")
-                await trigger_stepdown(manager, loser)
-            except Exception as e:
-                logger.info(f"could not step down {current}: {e!r}")
-        await asyncio.sleep(1)
+    servers = await dc1_replicated_servers(manager)
+    cql = manager.get_cql()
+    dc1 = [s for s in servers if s.datacenter == 'dc1']
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'dc1': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        dc1_saved = {s.server_id: saved[s.server_id] for s in dc1}
+        await plant_upload_dirs(dc1_saved)
+
+        injection = "upload_tablet_before_transport"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
+
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(dc1[0].ip_addr, ks, cf, timeout=300))
+
+        releaser = None
+        new_server = None
+        try:
+            async def work_exists():
+                rows = await cql.run_async("SELECT tablet_id FROM system.upload_work")
+                return True if rows else None
+            await wait_for(work_exists, time.time() + 90, period=0.1)
+
+            # Snapshot the raft log so the new node joins by snapshot, not by replaying commands.
+            coordinator_host = await get_topology_coordinator(manager)
+            coordinator = await manager.find_server_by_host_id(servers, coordinator_host)
+            await trigger_snapshot(manager, coordinator)
+
+            # dc2 so the newcomer replicates nothing of the keyspace: its only copy of the
+            # work tables can have come through group0.
+            new_server = await manager.server_add(property_file={"dc": "dc2", "rack": "r2"})
+
+            # Read the new node's own replica of the tables. The barrier makes it apply
+            # whatever it was handed first; with the log snapshotted above, that was a raft
+            # snapshot, which is the transfer under test.
+            await read_barrier(manager.api, new_server.ip_addr)
+            new_hosts = await wait_for_cql_and_get_hosts(cql, [new_server], time.time() + 60)
+            work = await cql.run_async("SELECT tablet_id FROM system.upload_work", host=new_hosts[0])
+            assert work, ("the snapshot-joined node holds no upload work rows: system.upload_work "
+                          "is missing from the raft snapshot transfer")
+            state = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state", host=new_hosts[0])
+            assert state, ("the snapshot-joined node holds no upload tablet state: "
+                           "system.upload_tablet_state is missing from the raft snapshot transfer")
+            logger.info(f"snapshot-joined node holds {len(work)} work and {len(state)} state rows")
+
+            releaser = start_releasing(manager, [*dc1, new_server], injection)
+            await upload
+        finally:
+            if releaser:
+                releaser.cancel()
+            for s in [*servers] + ([new_server] if new_server else []):
+                try:
+                    await manager.api.disable_injection(s.ip_addr, injection)
+                except Exception:
+                    pass
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ONE
+        got = {row.pk for row in await cql.run_async(stmt)}
+        missing = {str(k) for k in range(KEYS)} - got
+        assert not missing, f"{len(missing)} rows were never loaded"
+
+        await wait_for_upload_dirs_empty(dc1_saved)
