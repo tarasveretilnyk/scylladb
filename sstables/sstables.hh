@@ -376,6 +376,14 @@ public:
         _marked_for_deletion = mark_for_deletion::marked;
     }
 
+    // Clears the implicit deletion mark get_writer() sets, for when a *different* object has
+    // committed the same file - the cross-shard combine seals over it on the owning shard.
+    void mark_committed() noexcept {
+        if (_marked_for_deletion == mark_for_deletion::implicit) {
+            _marked_for_deletion = mark_for_deletion::none;
+        }
+    }
+
     bool marked_for_deletion() const {
         return _marked_for_deletion == mark_for_deletion::marked;
     }
