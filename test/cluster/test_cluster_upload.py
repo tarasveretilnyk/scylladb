@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 KEYS = 2048
 
+# Wake the load balancer every second (default 60s) so tablet splits and migrations finalize fast.
+BALANCER_CFG = {'tablet_load_stats_refresh_interval_in_seconds': 1}
+
 
 async def populate(cql, ks, cf):
     insert = cql.prepare(f"INSERT INTO {ks}.{cf} (pk, value) VALUES (?, ?)")
@@ -136,7 +139,7 @@ async def test_cluster_upload_loads_all_data(manager: ScyllaClusterManager):
     the node it is called on: here the data is planted on all nodes but the request is
     issued once.
     """
-    servers = await manager.servers_add(3)
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -178,7 +181,7 @@ async def test_cluster_upload_uses_tablet_transitions(manager: ScyllaClusterMana
     transitions in flight) is what makes that assertion writable; until then this test only
     confirms the mechanism, not its effect.
     """
-    servers = await manager.servers_add(3)
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -247,7 +250,7 @@ async def test_cluster_upload_and_node_join_complete_together(manager: ScyllaClu
     makes overlap harmless, the separation of the two load budgets, through the balancer's
     counters instead.
     """
-    servers = await manager.servers_add(3)
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -307,7 +310,7 @@ async def test_cluster_upload_load_is_not_charged_to_the_migration_budget(manage
     this checks - up_* moving while rd=/wr= stay at zero is precisely what keeps migrations
     admissible.
     """
-    servers = await manager.servers_add(2)
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -422,15 +425,8 @@ async def test_cluster_upload_fails_when_a_source_node_is_removed(manager: Scyll
         assert str(victim_host) in error, \
             f"the failure does not name the node that left, so an operator cannot tell which: {error}"
 
-        # A failed request must not wedge the table: a second upload has to be accepted and
-        # complete, rather than joining the failed request and inheriting its outcome.
-        #
-        # Deliberately not asserting that the survivors' upload directories still hold files.
-        # At RF=1 with files planted into the same tablet count they are all fully contained,
-        # so each survivor legitimately consumes its own before the request fails - there is
-        # nothing left to preserve. The straddling case, where a failure must not delete what
-        # it was still re-sending, is covered by test_cluster_upload_abort, which parks every
-        # transition before any transport runs and so can assert the directories untouched.
+        # A failed request must not wedge the table: a second upload must be accepted and complete.
+        # Survivor dirs are not checked - at RF=1 nothing straddles; see test_cluster_upload_abort.
         await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=240)
 
 
@@ -438,7 +434,7 @@ async def test_cluster_upload_fails_when_a_source_node_is_removed(manager: Scyll
 async def test_cluster_upload_rejects_vnode_table(manager: ScyllaClusterManager):
     """Cluster upload is tablet-only; a vnode table has to be rejected rather than
     silently doing nothing."""
-    servers = await manager.servers_add(1)
+    servers = await manager.servers_add(1, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -493,7 +489,7 @@ async def test_cluster_upload_with_empty_upload_dirs(manager: ScyllaClusterManag
     The coordinator short-circuits when every node reports an empty directory; without
     that the request would sit in the queue with no work to consume.
     """
-    servers = await manager.servers_add(2)
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -511,7 +507,7 @@ async def test_cluster_upload_pre_sizes_table(manager: ScyllaClusterManager):
     Loading into an under-provisioned table is what produces the oversized tablets the
     feature exists to avoid, so the resize has to happen first, not afterwards.
     """
-    servers = await manager.servers_add(2)
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -586,7 +582,7 @@ async def test_cluster_upload_work_drains_across_tablets(manager: ScyllaClusterM
     stream, and only a boundary-straddling one goes through mutations. Pinning the mutation
     path alone left this test measuring whichever tablets happened to need it.
     """
-    servers = await manager.servers_add(3)
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -677,7 +673,7 @@ async def test_cluster_upload_abort(manager: ScyllaClusterManager):
     can finish before the abort arrives, which is what made the old version of this test
     accept either outcome - and therefore assert nothing.
     """
-    servers = await manager.servers_add(3)
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -1062,7 +1058,7 @@ async def multi_dc_servers(manager):
         {"dc": "dc1", "rack": "r3"},
         {"dc": "dc2", "rack": "r1"},
         {"dc": "dc2", "rack": "r2"},
-    ])
+    ], config=BALANCER_CFG)
 
 
 @pytest.mark.asyncio
@@ -1172,7 +1168,7 @@ async def test_cluster_upload_combines_straddling_sstables_locally(manager: Scyl
     ever warranted. The absence of the mutation path is what the test is really pinning - a
     regression there would still load the data correctly and only show up as cost.
     """
-    server = await manager.server_add()
+    server = await manager.server_add(config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -1217,7 +1213,7 @@ async def test_cluster_upload_combines_straddling_sstables_locally(manager: Scyl
 async def test_cluster_upload_reports_metrics(manager: ScyllaClusterManager):
     """The scheduler's counters must move, since they are the only way to tell a slow upload
     from a stalled one in the field."""
-    servers = await manager.servers_add(2)
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
@@ -1293,7 +1289,7 @@ async def test_cluster_upload_rejects_second_request_for_same_table(manager: Scy
     Two independent requests would consume the same upload directories concurrently and
     ingest the same sstables twice - idempotent for ordinary rows, wrong for counters.
     """
-    servers = await manager.servers_add(2)
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
