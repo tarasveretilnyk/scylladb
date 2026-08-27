@@ -1715,3 +1715,60 @@ async def test_cluster_upload_counters_are_not_double_ingested(manager: ScyllaCl
         assert not wrong, (f"counters changed after re-uploading the same data, so a slice was "
                            f"ingested more than once or a re-upload re-applied deltas instead of "
                            f"merging counter shards: {dict(list(wrong.items())[:5])}")
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_accepts_numeric_generations(manager: ScyllaClusterManager):
+    """Sstables with legacy numeric generations must load, on both transports.
+
+    An upload directory taken off a Cassandra node is full of them - the upload directory
+    accepts numeric generations for exactly that reason - and the file-streaming path used to
+    put the source generation on the wire with generation_type::as_uuid(), which reports an
+    internal error for anything not UUID-based. The transition then failed and was retried
+    forever, on precisely the input the feature exists to migrate.
+
+    RF=3 so that some tablets are not owned by the node holding their files, which is what
+    puts them on the file-streaming path; the rest take the same-host path, so one run covers
+    both.
+    """
+    servers = await three_rack_servers(manager)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 3}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # Cassandra writes numeric generations (me-1-big-Data.db); the upload dir takes them as-is.
+        renamed = 0
+        for cf_dir, _ in saved.values():
+            upload = os.path.join(cf_dir, 'upload')
+            groups = {}
+            for name in os.listdir(upload):
+                parts = name.split('-')
+                if len(parts) < 4:
+                    continue
+                groups.setdefault('-'.join(parts[:2]), []).append(name)
+            for n, (key, names) in enumerate(sorted(groups.items()), start=1):
+                for name in names:
+                    parts = name.split('-')
+                    new_name = '-'.join([parts[0], str(n)] + parts[2:])
+                    if new_name != name:
+                        os.rename(os.path.join(upload, name), os.path.join(upload, new_name))
+                        renamed += 1
+        assert renamed, "no file was renamed, so this test would pass without proving anything"
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=240)
+
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == {str(k) for k in range(KEYS)}
+        await wait_for_upload_dirs_empty(saved)
