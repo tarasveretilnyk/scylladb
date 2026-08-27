@@ -3242,7 +3242,9 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
 
         // FIXME: Checking tablet_count <= max_tablet_count should be enough, but the restore code currently has a limitation and it cannot handle
         // any merges or splits until the restore transitions are done
-        if (tablet_count == *max_tablet_count) {
+        // Also wait for the resize decision to clear, not just the count: needs_split() can be set
+        // at max_tablet_count, and maybe_split_new_sstable() then unlinks freshly added sstables.
+        if (tablet_count == *max_tablet_count && !tmap.needs_split() && !tmap.needs_merge()) {
             break;
         }
         co_await _topology_state_machine.event.when();
