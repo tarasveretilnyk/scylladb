@@ -530,17 +530,17 @@ future<> stream_blob_handler(replica::database& db, db::view::view_building_work
 //      newgen:    3ga1_0iiv_3vj5c2flv7lgdl2j0d
 //     newname: me-3ga1_0iiv_3vj5c2flv7lgdl2j0d-big-Index.db
 static std::string get_sstable_name_with_generation(const file_stream_id& ops_id, const std::string& oldname, const std::string& newgen) {
-    std::string newname = oldname;
-    // The generation name starts after the first '-'.
-    auto it = newname.find("-");
-    if (it != std::string::npos) {
-        newname.replace(++it, newgen.size(), newgen);
-        return newname;
-    } else {
+    // Component names are <version>-<generation>-<format>-<component>, so replace everything
+    // between the first two dashes; an in-place overwrite breaks on shorter legacy numeric gens.
+    auto gen_start = oldname.find('-');
+    auto gen_end = gen_start == std::string::npos
+            ? std::string::npos : oldname.find('-', gen_start + 1);
+    if (gen_start == std::string::npos || gen_end == std::string::npos) {
         auto msg = fmt::format("fstream[{}] Failed to get sstable name for {} with generation {}", ops_id, oldname, newgen);
         blogger.warn("{}", msg);
         throw std::runtime_error(msg);
     }
+    return oldname.substr(0, gen_start + 1) + newgen + oldname.substr(gen_end);
 }
 }
 
