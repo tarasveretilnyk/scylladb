@@ -1647,3 +1647,71 @@ async def test_cluster_upload_resumes_a_partial_attach(manager: ScyllaClusterMan
         assert all(r.value == int(r.pk) for r in rows), "values were corrupted by the resume"
 
         await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_counters_are_not_double_ingested(manager: ScyllaClusterManager):
+    """A boundary-straddling counter sstable must load correctly and re-uploading it must not
+    double-count, while a resize and migrations run concurrently.
+
+    Cluster upload copies counter shards verbatim - the receive path writes fragments straight
+    into an sstable and the combine path rewrites without any read-modify-write, exactly as
+    repair does - so loading a counter sstable, and loading the identical sstable again, is
+    idempotent: the counter reconciles to the same value both times rather than adding. That
+    makes counters a precise integrity check - a slice ingested twice, a re-upload that
+    re-applied deltas instead of merging shards, or lost data would each show up as a value
+    other than 1.
+
+    The files are made to straddle tablet boundaries by planting sstables written when the
+    table had two tablets into a table pre-sized to four, which forces the read-combine path.
+    The concurrent resize and the migrations it drives are what previously raced sstable
+    deletion against a migration reading the same sstable and hung the load.
+    """
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, c counter) "
+                            f"WITH tablets = {{'min_tablet_count': 2}}")
+
+        keys = [str(k) for k in range(256)]
+        bump = cql.prepare(f"UPDATE {ks}.{cf} SET c = c + 1 WHERE pk = ?")
+        bump.consistency_level = ConsistencyLevel.ALL
+
+        await asyncio.gather(*(cql.run_async(bump, (k,)) for k in keys))
+        await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+
+        stmt = cql.prepare(f"SELECT pk, c FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ONE
+
+        await plant_upload_dirs(saved)
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf,
+                                                  tablet_count=4, timeout=240)
+        await wait_for_upload_dirs_empty(saved)
+
+        after_first = {r.pk: r.c for r in await cql.run_async(stmt)}
+        assert set(after_first) == set(keys), (
+            "the first upload did not load every counter - either counters are not a supported "
+            "input for cluster upload, or the load lost rows")
+        wrong = {k: v for k, v in after_first.items() if v != 1}
+        assert not wrong, (f"counters are not exactly 1 after a single upload: either counter "
+                           f"cells are not preserved through this path, or a slice was ingested "
+                           f"more than once within one request: {dict(list(wrong.items())[:5])}")
+
+        # The same files again: counter shards are copied verbatim, so re-loading identical cells
+        # reconciles to the same value rather than adding - every counter must still be exactly 1.
+        await plant_upload_dirs(saved)
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=240)
+        await wait_for_upload_dirs_empty(saved)
+
+        after_second = {r.pk: r.c for r in await cql.run_async(stmt)}
+        assert set(after_second) == set(keys), "the second upload lost counters"
+        wrong = {k: v for k, v in after_second.items() if v != 1}
+        assert not wrong, (f"counters changed after re-uploading the same data, so a slice was "
+                           f"ingested more than once or a re-upload re-applied deltas instead of "
+                           f"merging counter shards: {dict(list(wrong.items())[:5])}")
