@@ -1582,3 +1582,68 @@ async def test_cluster_upload_abort_before_request_exists(manager: ScyllaCluster
         got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
         assert got == {str(k) for k in range(KEYS)}
         await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_resumes_a_partial_attach(manager: ScyllaClusterManager):
+    """An attach that fails part way must resume, attaching neither twice nor never.
+
+    The same-host path moves each fully contained sstable out of the upload directory and then
+    attaches them on the tablet's owning shard. Those two steps are not atomic, and the move
+    is what makes a retry skip the file - so a failure in between left sstables sitting in the
+    table directory, in no sstable set, invisible until a restart scan. Attaching the whole
+    batch again on retry is not the answer either: add_sstables_and_update_cache() is a loop,
+    not an atomic step, so the ones already in would go in twice.
+
+    RF=1 on an unchanged topology puts every tablet's data on its own replica, which is what
+    makes every transition take the same-host path this covers.
+    """
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+
+        # Two flushed halves so every tablet gets two sstables: the injection fires only once an
+        # attach is past its first sstable, and would never fire with one sstable per tablet.
+        insert = cql.prepare(f"INSERT INTO {ks}.{cf} (pk, value) VALUES (?, ?)")
+        insert.consistency_level = ConsistencyLevel.ALL
+        await asyncio.gather(*(cql.run_async(insert, (str(k), k)) for k in range(KEYS // 2)))
+        await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+        await asyncio.gather(*(cql.run_async(insert, (str(k), k)) for k in range(KEYS // 2, KEYS)))
+        await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        injection = "upload_attach_fail_once"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=True)
+
+        logs = [await manager.server_open_log(s.server_id) for s in servers]
+        marks = [await lg.mark() for lg in logs]
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=240)
+
+        failed = []
+        for lg, mk in zip(logs, marks):
+            failed += await lg.grep(r"upload_attach_fail_once|"
+                                    r"Attaching upload sstables for tablet .* failed after",
+                                    from_mark=mk)
+        assert failed, ("the injection never fired, so this test proved nothing about "
+                        "resuming a partial attach")
+
+        # Row count is not enough - a re-attach duplicates only if values differ, so check them.
+        stmt = cql.prepare(f"SELECT pk, value FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ONE
+        rows = await cql.run_async(stmt)
+        assert {r.pk for r in rows} == {str(k) for k in range(KEYS)}, \
+            "rows were lost by an attach that failed part way and was never resumed"
+        assert all(r.value == int(r.pk) for r in rows), "values were corrupted by the resume"
+
+        await wait_for_upload_dirs_empty(saved)
