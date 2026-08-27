@@ -54,6 +54,14 @@ static sstables::sstable_state sstable_state(const streaming::stream_blob_meta& 
 }
 
 static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::database& db, db::view::view_building_worker& vbw, table_id id, sstables::sstable_state state, sstables::entry_descriptor desc, seastar::shard_id shard) {
+    // The sender chose the shard from its own view of this node's replica. A node restarted with
+    // fewer shards can be asked for one it no longer has, and invoke_on() past the shard count
+    // is UB.
+    if (shard >= this_smp_shard_count()) {
+        throw std::runtime_error(fmt::format(
+                "stream_blob[{}]: asked to attach an sstable of table {} on shard {}, but this "
+                "node has {} shards", ops_id, id, shard, this_smp_shard_count()));
+    }
     auto& sharded_vbw = vbw.container();
     co_await db.container().invoke_on(shard, [&sharded_vbw, id, desc, state, ops_id] (replica::database& db) -> future<> {
         replica::table& t = db.find_column_family(id);
@@ -214,6 +222,14 @@ public:
 };
 
 future<logstor_sink> make_logstor_sink(sharded<replica::database>& db, table_id tid, shard_id target_shard) {
+    // The shard comes from the wire, chosen from the sender's view of this node. A node restarted
+    // with fewer shards can be asked for one it no longer has, and invoke_on() past the shard
+    // count is UB.
+    if (target_shard >= this_smp_shard_count()) {
+        throw std::runtime_error(fmt::format(
+                "stream_blob: asked to write logstor segments of table {} on shard {}, but this "
+                "node has {} shards", tid, target_shard, this_smp_shard_count()));
+    }
     auto sink = co_await db.invoke_on(target_shard, [tid] (replica::database& db) -> future<foreign_segment_sink> {
         auto& table = db.find_column_family(tid);
         auto segment_sink = co_await table.create_logstor_segment_sink(db);
