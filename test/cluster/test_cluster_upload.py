@@ -1772,3 +1772,100 @@ async def test_cluster_upload_accepts_numeric_generations(manager: ScyllaCluster
         got = {row.pk for row in await cql.run_async(stmt)}
         assert got == {str(k) for k in range(KEYS)}
         await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_tablet_with_no_partitions_in_its_slice(manager: ScyllaClusterManager):
+    """A tablet an sstable overlaps but holds no partition for must not wedge the request.
+
+    An sstable straddles a tablet if the tablet's range falls between the sstable's first and
+    last token - which says nothing about whether any partition actually lands inside it. The
+    combine path used to write the slice out and then ask data_size() whether it was empty, but
+    an sstable with no partitions cannot be written at all: seal_summary() rejects it and the
+    BTI writer dereferences an unset first key. The transition therefore threw, was retried,
+    threw again on the same input, and the request never finished.
+
+    Whole-ring sstables planted into a table with many more tablets than keys make this the
+    common case rather than an edge one: with 32 keys spread over 32 tablets, plenty of tablets
+    end up overlapped by a file that holds nothing for them.
+    """
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 2}}")
+
+        # Few keys against many tablets, so some tablets are overlapped by a file holding nothing.
+        keys = [str(k) for k in range(32)]
+        insert = cql.prepare(f"INSERT INTO {ks}.{cf} (pk, value) VALUES (?, ?)")
+        insert.consistency_level = ConsistencyLevel.ALL
+        await asyncio.gather(*(cql.run_async(insert, (k, int(k))) for k in keys))
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        # Before the fix it retried the empty slices forever, so the timeout is the assertion.
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf,
+                                                  tablet_count=32, timeout=240)
+
+        assert await tablet_count(manager, cql, ks, cf) >= 32
+        stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
+        stmt.consistency_level = ConsistencyLevel.ONE
+        got = {row.pk for row in await cql.run_async(stmt)}
+        assert got == set(keys), f"rows lost while skipping empty slices: {set(keys) - got}"
+        await wait_for_upload_dirs_empty(saved)
+
+
+async def dc1_replicated_servers(manager):
+    """Three dc1 nodes replicate the upload keyspace at RF=3; one dc2 node holds none of it.
+
+    The joining node goes into dc2, so it is never a replica, a source, or an upload primary -
+    the whole load lives in dc1. That is what lets it take over coordination mid-upload without
+    removing a node or losing a source, both of which are unavoidable at RF=3-on-three-nodes
+    where every node carries the entire ring. The fourth (dc2) node is here only so that, once
+    the newcomer makes five, group 0 has room to make the newcomer a voter and hence electable.
+    """
+    return await manager.servers_add(4, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r3"},
+        {"dc": "dc2", "rack": "r1"},
+    ])
+
+
+async def drive_coordinator_to(manager, live, target_host, deadline):
+    """Step down whoever leads until `target_host` does, then return; assert it got there in time.
+
+    Raft will not hand leadership to a chosen node, so this repeatedly steps the current leader
+    down and re-reads who won until the target does. `live` is every node that can answer a
+    leader probe, the target included; probes tolerate failure because an election may be in
+    progress and a stale node can answer 500. get_topology_coordinator() is avoided for the same
+    reason: it takes a read barrier through whichever host the driver offers.
+    """
+    while True:
+        current = None
+        for probe in live:
+            try:
+                current = await manager.api.get_raft_leader(probe.ip_addr)
+                break
+            except Exception as e:
+                logger.info(f"leader probe via {probe.ip_addr} failed: {e!r}")
+        if current is not None and str(current) == str(target_host):
+            logger.info(f"coordinator is now {current}")
+            return
+        assert time.time() < deadline, (
+            f"the coordinator never moved to {target_host} (it is {current}), so this run "
+            f"did not exercise the snapshot transfer")
+        if current is not None:
+            try:
+                loser = await manager.find_server_by_host_id(live, current)
+                logger.info(f"coordinator is {current}, stepping it down to reach {target_host}")
+                await trigger_stepdown(manager, loser)
+            except Exception as e:
+                logger.info(f"could not step down {current}: {e!r}")
+        await asyncio.sleep(1)
