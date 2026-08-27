@@ -1417,3 +1417,168 @@ async def test_cluster_upload_into_non_empty_table(manager: ScyllaClusterManager
             assert rows[str(k)] == k, f"value for {k} became {rows[str(k)]} after the merge"
 
         await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_abort_while_preparing(manager: ScyllaClusterManager):
+    """Aborting a request that has not started yet must stop it, not report success.
+
+    A request joins ongoing_upload_requests only at the very end of preparation, after the
+    directory scan on every node and after every batch of work rows has been flushed - minutes
+    on a large directory. Aborting in that window used to find nothing to cancel, log "Aborted
+    cluster upload", return success, and let the load proceed to completion afterwards.
+
+    The scan is held open so the abort lands squarely in that window: no work rows exist yet
+    and no transition has been created, which is exactly the state that had no coverage.
+    """
+    servers = await manager.servers_add(3, config=BALANCER_CFG)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 16}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+        planted = await upload_dir_files(saved)
+        assert planted, "nothing was planted, so the rest of this test would prove nothing"
+
+        injection = "upload_prepare_before_scan"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
+
+        tid = await table_id_of(cql, ks, cf)
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180))
+
+        # Matched on upload_table_id, not request_type, whose encoding this test should not know.
+        async def preparing():
+            rows = await cql.run_async("SELECT upload_table_id, done FROM system.topology_requests "
+                                       "ALLOW FILTERING")
+            live = [r for r in rows
+                    if getattr(r, 'upload_table_id', None) == tid and not r.done]
+            if not live:
+                return None
+            work = await cql.run_async("SELECT tablet_id FROM system.upload_work")
+            assert not work, "work rows exist although the scan is still held"
+            return True
+
+        releaser = None
+        try:
+            await wait_for(preparing, time.time() + 60, period=0.1)
+            await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
+
+            async def release():
+                while True:
+                    for s in servers:
+                        try:
+                            await manager.api.message_injection(s.ip_addr, injection)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.05)
+
+            releaser = asyncio.create_task(release())
+
+            with pytest.raises(Exception) as excinfo:
+                await upload
+            assert "abort" in str(excinfo.value).lower(), \
+                f"the request did not fail with the abort as its reason: {excinfo.value}"
+        finally:
+            if releaser:
+                releaser.cancel()
+            for s in servers:
+                try:
+                    await manager.api.disable_injection(s.ip_addr, injection)
+                except Exception:
+                    pass
+
+        rows = await cql.run_async(f"SELECT stage FROM system.tablets WHERE table_id = {tid}")
+        assert not [r for r in rows if r.stage == 'upload'], \
+            "a transition was created for a request that was aborted before it started"
+
+        left = await upload_dir_files(saved)
+        assert set(left) == set(planted), \
+            f"abort during preparation touched the upload directories: planted {planted}, left {left}"
+        assert await cql.run_async(f"SELECT count(*) FROM {ks}.{cf}") == [(0,)]
+
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180)
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+        await wait_for_upload_dirs_empty(saved)
+
+
+@pytest.mark.asyncio
+async def test_cluster_upload_abort_before_request_exists(manager: ScyllaClusterManager):
+    """An abort that lands before the task has registered its request must still stop the load.
+
+    The task pre-sizes the table and takes a group0 guard before it commits the request, and the
+    abort is keyed by table: it used to scan the request queue, find nothing, log "nothing to
+    abort" and return success. The load then ran to completion and consumed the upload
+    directories, after which the task reported itself failed with "abort requested".
+
+    The task is held just before it registers the request, which is the whole window in one
+    place, and aborted through the REST endpoint nodetool --abort uses.
+    """
+    servers = await manager.servers_add(2, config=BALANCER_CFG)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 1}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 8}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+        planted = await upload_dir_files(saved)
+        assert planted, "nothing was planted, so the rest of this test would prove nothing"
+
+        injection = "cluster_upload_before_request"
+        await manager.api.enable_injection(servers[0].ip_addr, injection, one_shot=True)
+        log = await manager.server_open_log(servers[0].server_id)
+        mark = await log.mark()
+
+        task_id = await manager.api.tablets_upload(servers[0].ip_addr, ks, cf, timeout=60)
+        try:
+            await log.wait_for("cluster_upload_before_request: paused", from_mark=mark, timeout=60)
+            await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
+        finally:
+            try:
+                await manager.api.message_injection(servers[0].ip_addr, injection)
+            except Exception:
+                pass
+            try:
+                await manager.api.disable_injection(servers[0].ip_addr, injection)
+            except Exception:
+                pass
+
+        status = await manager.api.wait_task(servers[0].ip_addr, task_id)
+        assert status is not None and status['state'] == 'failed', \
+            f"the aborted task did not fail: {status}"
+        assert 'abort' in status['error'].lower(), \
+            f"the task did not fail with the abort as its reason: {status['error']}"
+
+        tid = await table_id_of(cql, ks, cf)
+        rows = await cql.run_async("SELECT upload_table_id, done FROM system.topology_requests "
+                                   "ALLOW FILTERING")
+        assert not [r for r in rows if getattr(r, 'upload_table_id', None) == tid and not r.done], \
+            "the aborted task left a live upload request behind"
+
+        left = await upload_dir_files(saved)
+        assert set(left) == set(planted), \
+            f"the aborted load touched the upload directories: planted {planted}, left {left}"
+        assert await cql.run_async(f"SELECT count(*) FROM {ks}.{cf}") == [(0,)]
+
+        # Nothing is left behind that would stop a fresh request.
+        await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180)
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+        await wait_for_upload_dirs_empty(saved)
