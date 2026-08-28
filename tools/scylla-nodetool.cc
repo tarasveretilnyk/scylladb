@@ -618,6 +618,38 @@ void cluster_cleanup_operation(scylla_rest_client& client, const bpo::variables_
     client.post("/storage_service/cleanup_all/", std::move(params));
 }
 
+
+// Report a long-running cluster task the way nodetool refresh does. Shared by upload and backup.
+void wait_for_cluster_task(scylla_rest_client& client, const bpo::variables_map& vm, std::string_view task_id) {
+    if (vm.contains("nowait")) {
+        fmt::print(R"(The task id of this operation is {}
+Please use the 'task' subcommands to manage the task.
+)",
+                   task_id);
+        return;
+    }
+
+    const auto url = seastar::format("/task_manager/wait_task/{}", task_id);
+    const auto wait_res = client.get(url);
+    const auto& status = wait_res.GetObject();
+    auto state = rjson::to_string_view(status["state"]);
+    fmt::print("{}", state);
+    int exit_code = EXIT_SUCCESS;
+    if (state != "done") {
+        exit_code = EXIT_FAILURE;
+        fmt::print(": {}", rjson::to_string_view(status["error"]));
+    }
+    fmt::print(R"(
+start: {}
+end: {}
+)",
+               rjson::to_string_view(status["start_time"]),
+               rjson::to_string_view(status["end_time"]));
+    if (exit_code != EXIT_SUCCESS) {
+        throw operation_failed_with_status{exit_code};
+    }
+}
+
 void cluster_repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::vector<sstring> keyspaces, tables;
     if (vm.contains("keyspace")) {
@@ -2533,33 +2565,7 @@ void cluster_backup_operation(scylla_rest_client& client, const bpo::variables_m
         );
     fmt::print(std::cout, "Snapshot directory: {}\n", params["snapshot"]);
 
-    if (vm.contains("nowait")) {
-        fmt::print(R"(The task id of this operation is {}
-Please use the 'task' subcommands to manage the task.
-)",
-                   task_id);
-        return;
-    }
-
-    const auto url = seastar::format("/task_manager/wait_task/{}", task_id);
-    const auto wait_res = client.get(url);
-    const auto& status = wait_res.GetObject();
-    auto state = rjson::to_string_view(status["state"]);
-    fmt::print("{}", state);
-    int exit_code = EXIT_SUCCESS;
-    if (state != "done") {
-        exit_code = EXIT_FAILURE;
-        fmt::print(": {}", rjson::to_string_view(status["error"]));
-    }
-    fmt::print(R"(
-start: {}
-end: {}
-)",
-               rjson::to_string_view(status["start_time"]),
-               rjson::to_string_view(status["end_time"]));
-    if (exit_code != EXIT_SUCCESS) {
-        throw operation_failed_with_status{exit_code};
-    }
+    wait_for_cluster_task(client, vm, task_id);
 }
 
 void migrate_to_tablets_start_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
