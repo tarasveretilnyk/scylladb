@@ -2290,16 +2290,63 @@ future<manifest_summary> populate_snapshot_sstables_from_manifests(sstables::sto
     };
 }
 
-class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::task::impl {
+class sstables_loader::progress_reporting_task_impl : public tasks::task_manager::task::impl {
+protected:
+    tasks::task_manager::task::progress _progress;
+    // Set by run() with its final figures: an update already in flight when the timer was
+    // cancelled must not overwrite them, or a finished task reports completed < total.
+    bool _progress_frozen = false;
+    seastar::named_gate _gate{"progress_updater"};
+    timer<seastar::lowres_clock> _progress_update_timer;
+
+    using tasks::task_manager::task::impl::impl;
+
+    virtual future<> update_progress() = 0;
+
+    void init_progress_timer() {
+        _progress_update_timer.set_callback([this] {
+            if (auto gh = _gate.try_hold()) {
+                std::ignore = update_progress().handle_exception([] (std::exception_ptr ex) {
+                    llog.warn("Failed to update task progress: {}", ex);
+                }).finally([this, gh = std::move(*gh)] {
+                    if (!_gate.is_closed()) {
+                        _progress_update_timer.rearm(lowres_clock::now() + 5s);
+                    }
+                });
+            }
+        });
+    }
+
+    virtual tasks::is_internal is_internal() const noexcept override {
+        return tasks::is_internal::no;
+    }
+
+    virtual tasks::is_user_task is_user_task() const noexcept override {
+        return tasks::is_user_task::yes;
+    }
+
+    tasks::is_abortable is_abortable() const noexcept override {
+        return tasks::is_abortable::yes;
+    }
+
+public:
+    future<tasks::task_manager::task::progress> get_progress() const override {
+        co_return _progress;
+    }
+
+    future<> release_resources() noexcept override {
+        _progress_update_timer.cancel();
+        co_await _gate.close();
+    }
+};
+
+class sstables_loader::tablet_restore_task_impl : public sstables_loader::progress_reporting_task_impl {
     sharded<sstables_loader>& _loader;
     table_id _tid;
     sstring _snap_name;
     size_t _tablet_count;
-    tasks::task_manager::task::progress _progress;
-    seastar::named_gate _gate{"progress_updater"};
-    timer<seastar::lowres_clock> _progress_update_timer;
 
-    future<> update_progress() {
+    future<> update_progress() override {
         auto& loader = _loader.local();
         auto& db = loader._db.local();
         auto s = db.find_schema(_tid);
@@ -2318,46 +2365,29 @@ class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::ta
             progress.total += p.nr_sstables;
             progress.completed += p.nr_downloaded_sstables;
         });
+        if (_progress_frozen) {
+            co_return;
+        }
         _progress = progress;
     }
 
 public:
     tablet_restore_task_impl(tasks::task_manager::module_ptr module, sharded<sstables_loader>& loader, sstring ks,
             table_id tid, sstring snap_name, manifest_summary ms) noexcept
-        : tasks::task_manager::task::impl(module, tasks::task_id::create_random_id(), 0, "node", ks, "", "", tasks::task_id::create_null_id())
+        : progress_reporting_task_impl(module, tasks::task_id::create_random_id(), 0, "node", ks, "", "", tasks::task_id::create_null_id())
         , _loader(loader)
         , _tid(std::move(tid))
         , _snap_name(std::move(snap_name))
         , _tablet_count(ms.tablet_count)
-        , _progress_update_timer([this] {
-            if (auto gh = _gate.try_hold()) {
-                std::ignore = update_progress().finally([this, gh = std::move(*gh)] {
-                    if (!_gate.is_closed()) {
-                        _progress_update_timer.rearm(lowres_clock::now() + 5s);
-                    }
-                });
-            }
-        })
     {
         _status.progress_units = "sstables";
         _progress.total = ms.nr_sstables;
+        init_progress_timer();
         _progress_update_timer.arm(lowres_clock::now());
     }
 
     virtual std::string type() const override {
         return "restore_tablets";
-    }
-
-    virtual tasks::is_internal is_internal() const noexcept override {
-        return tasks::is_internal::no;
-    }
-
-    virtual tasks::is_user_task is_user_task() const noexcept override {
-        return tasks::is_user_task::yes;
-    }
-
-    tasks::is_abortable is_abortable() const noexcept override {
-        return tasks::is_abortable::yes;
     }
 
     void abort() noexcept override {
@@ -2369,15 +2399,6 @@ public:
         (void)_loader.local()._ss.local().abort_restore_tablets(_tid).handle_exception([tid = _tid] (std::exception_ptr ex) {
             llog.warn("Failed to abort restore for table {}: {}", tid, ex);
         });
-    }
-
-    future<tasks::task_manager::task::progress> get_progress() const override {
-        co_return _progress;
-    }
-
-    future<> release_resources() noexcept override {
-        _progress_update_timer.cancel();
-        co_await _gate.close();
     }
 
 protected:
@@ -2413,6 +2434,7 @@ protected:
         // Restore complete. The total was known upfront from manifest parsing.
         // Mark all progress as complete and stop the background update timer.
         _progress_update_timer.cancel();
+        _progress_frozen = true;
         _progress.completed = _progress.total;
     }
 };

@@ -274,6 +274,7 @@ public:
     }
 
     class download_task_impl;
+    class progress_reporting_task_impl;
     class tablet_restore_task_impl;
 };
 
