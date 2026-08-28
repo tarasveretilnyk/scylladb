@@ -2387,7 +2387,7 @@ protected:
         auto current_schema = loader.local_db().find_schema(_tid);
         auto min_tablet_count = current_schema->tablet_options().min_tablet_count;
         auto max_tablet_count = current_schema->tablet_options().max_tablet_count;
-        co_await loader._ss.local().alter_table_with_tablet_hints(_tid, _tablet_count, _tablet_count);
+        co_await loader._ss.local().alter_table_with_tablet_hints(_tid, _tablet_count, _tablet_count, true, false, &_as);
 
         std::exception_ptr eptr;
         try {
@@ -2399,7 +2399,9 @@ protected:
 
         try {
             llog.info("Restoring table with tid {} to the original schema", _tid);
-            co_await loader._ss.local().alter_table_with_tablet_hints(_tid, min_tablet_count, max_tablet_count, false);
+            // remove_unset: the table saved nullopt because it had no hint of its own, and passing
+            // nullopt would leave it pinned at min == max.
+            co_await loader._ss.local().alter_table_with_tablet_hints(_tid, min_tablet_count, max_tablet_count, false, true);
         } catch (...) {
             llog.error("Failed to restore original schema for table_id {}. Error: {}", _tid, std::current_exception());
         }

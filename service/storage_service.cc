@@ -3172,14 +3172,10 @@ future<> storage_service::wait_for_topology_not_busy() {
 future<> storage_service::alter_table_with_tablet_hints(table_id tid,
                                                         std::optional<size_t> min_tablet_count,
                                                         std::optional<size_t> max_tablet_count,
-                                                        bool wait_balancer) {
-    if (this_shard_id() != 0) {
-        co_return co_await container().invoke_on(0, [&] (auto& ss) {
-            return ss.alter_table_with_tablet_hints(tid, min_tablet_count, max_tablet_count, wait_balancer);
-        });
-    }
-
-    if (!min_tablet_count && !max_tablet_count) {
+                                                        bool wait_balancer,
+                                                        bool remove_unset,
+                                                        seastar::abort_source* as) {
+    if (!min_tablet_count && !max_tablet_count && !remove_unset) {
         slogger.info("alter_table_with_tablet_hints: the tablet hints passed are both nullopt, nothing to update");
         co_return;
     }
@@ -3191,6 +3187,37 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
             max_tablet_count ? to_sstring(*max_tablet_count) : "nullopt"));
     }
 
+    if (this_shard_id() != 0) {
+        co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.set_tablet_hints(tid, min_tablet_count, max_tablet_count, remove_unset);
+        });
+    } else {
+        co_await set_tablet_hints(tid, min_tablet_count, max_tablet_count, remove_unset);
+    }
+
+    if (!wait_balancer) {
+        co_return;
+    }
+
+    // Waited in bounded steps from the calling shard, so the caller's abort source is consulted
+    // between them without ever being touched from shard 0, where the wait itself happens.
+    while (true) {
+        if (as) {
+            as->check();
+        }
+        bool settled = co_await container().invoke_on(0, [tid, count = *max_tablet_count] (auto& ss) {
+            return ss.wait_for_tablet_count(tid, count, std::chrono::seconds(1));
+        });
+        if (settled) {
+            break;
+        }
+    }
+}
+
+future<> storage_service::set_tablet_hints(table_id tid,
+                                           std::optional<size_t> min_tablet_count,
+                                           std::optional<size_t> max_tablet_count,
+                                           bool remove_unset) {
     auto& mm = _migration_manager.local();
     auto& sp = mm.get_storage_proxy();
 
@@ -3204,9 +3231,13 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
         auto tablet_options = schema->raw_tablet_options();
         if (min_tablet_count) {
             tablet_options["min_tablet_count"] = to_sstring(*min_tablet_count);
+        } else if (remove_unset) {
+            tablet_options.erase("min_tablet_count");
         }
         if (max_tablet_count) {
             tablet_options["max_tablet_count"] = to_sstring(*max_tablet_count);
+        } else if (remove_unset) {
+            tablet_options.erase("max_tablet_count");
         }
 
         schema_builder builder(schema);
@@ -3216,8 +3247,8 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
         auto ts = group0_guard.write_timestamp();
         sstring description = format("Altering table {}.{} with tablet count hints min_tablet_count={} max_tablet_count={}",
             schema->ks_name(), schema->cf_name(),
-            min_tablet_count ? to_sstring(*min_tablet_count) : "unchanged",
-            max_tablet_count ? to_sstring(*max_tablet_count) : "unchanged");
+            min_tablet_count ? to_sstring(*min_tablet_count) : (remove_unset ? "removed" : "unchanged"),
+            max_tablet_count ? to_sstring(*max_tablet_count) : (remove_unset ? "removed" : "unchanged"));
 
         auto mutations = co_await prepare_column_family_update_announcement(sp, modified_schema, /*view_updates=*/{}, ts);
 
@@ -3230,26 +3261,38 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
             }
         }
     }
+}
 
-    if (!wait_balancer) {
-        co_return;
-    }
-
-    while (true) {
+future<bool> storage_service::wait_for_tablet_count(table_id tid, size_t count, std::chrono::milliseconds timeout) {
+    auto settled = [&] {
         auto tmptr = get_token_metadata_ptr();
         auto& tmap = tmptr->tablets().get_tablet_map(tid);
-        auto tablet_count = tmap.tablet_count();
-
         // FIXME: Checking tablet_count <= max_tablet_count should be enough, but the restore code currently has a limitation and it cannot handle
         // any merges or splits until the restore transitions are done
         // Also wait for the resize decision to clear, not just the count: needs_split() can be set
         // at max_tablet_count, and maybe_split_new_sstable() then unlinks freshly added sstables.
-        if (tablet_count == *max_tablet_count && !tmap.needs_split() && !tmap.needs_merge()) {
-            break;
-        }
-        co_await _topology_state_machine.event.when();
-        // FIXME: add an abort_source propagated from the root of the restore operation (SCYLLADB-1076)
+        return tmap.tablet_count() == count && !tmap.needs_split() && !tmap.needs_merge();
+    };
+    if (settled()) {
+        co_return true;
     }
+    // Waiting on the balancer is only sound while it can act: with balancing disabled
+    // make_resize_plan() returns before it revokes or finalizes anything, and a table with a
+    // cluster upload in flight is skipped by it until the upload finishes. Either would make the
+    // wait indefinite, so fail instead.
+    if (!get_token_metadata_ptr()->tablets().balancing_enabled()) {
+        throw std::runtime_error(format("Table {} cannot be brought to {} tablets: tablet balancing is disabled, "
+                "so the balancer will not resize it", tid, count));
+    }
+    if (co_await has_upload_request_for(tid)) {
+        throw std::runtime_error(format("Table {} cannot be brought to {} tablets: it has a cluster upload in "
+                "flight, and its tablet count is held until that finishes", tid, count));
+    }
+    try {
+        co_await _topology_state_machine.event.when(timeout);
+    } catch (const seastar::condition_variable_timed_out&) {
+    }
+    co_return settled();
 }
 
 future<> storage_service::abort_rf_change(utils::UUID request_id) {

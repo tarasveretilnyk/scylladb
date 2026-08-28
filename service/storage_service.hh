@@ -1106,10 +1106,21 @@ public:
     // hints are applied; if both are disengaged the call is a no-op. When
     // wait_balancer is set, waits for the load balancer to reach the requested
     // tablet count (which requires both hints to be engaged and equal).
+    // When remove_unset is set, a nullopt hint removes that key rather than leaving it
+    // unchanged - needed to restore a table that had no hint of its own.
+    // The wait ends early, with an error, when the balancer cannot get there: balancing is
+    // disabled, or the table has a cluster upload in flight. `as` interrupts it.
     future<> alter_table_with_tablet_hints(table_id tid,
                                            std::optional<size_t> min_tablet_count,
                                            std::optional<size_t> max_tablet_count,
-                                           bool wait_balancer = true);
+                                           bool wait_balancer = true,
+                                           bool remove_unset = false,
+                                           seastar::abort_source* as = nullptr);
+    // The two halves of the above: the schema change (shard 0), and one bounded wait for the
+    // table to settle at `count` tablets (shard 0), true once it has.
+    future<> set_tablet_hints(table_id tid, std::optional<size_t> min_tablet_count,
+                              std::optional<size_t> max_tablet_count, bool remove_unset);
+    future<bool> wait_for_tablet_count(table_id tid, size_t count, std::chrono::milliseconds timeout);
 
     friend class join_node_rpc_handshaker;
     friend class node_ops::node_ops_virtual_task;
