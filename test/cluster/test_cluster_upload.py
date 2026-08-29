@@ -27,7 +27,7 @@ from test.cluster.util import (get_topology_coordinator, new_test_keyspace,
                                trigger_snapshot)
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.rest_client import HTTPError, read_barrier
-from test.pylib.tablets import get_base_table
+from test.pylib.tablets import get_all_tablet_replicas, get_base_table
 from test.pylib.util import wait_for, wait_for_cql_and_get_hosts
 
 logger = logging.getLogger(__name__)
@@ -1932,3 +1932,95 @@ async def test_cluster_upload_state_survives_raft_snapshot(manager: ScyllaCluste
         assert not missing, f"{len(missing)} rows were never loaded"
 
         await wait_for_upload_dirs_empty(dc1_saved)
+
+@pytest.mark.asyncio
+async def test_cluster_upload_primary_follows_migration(manager: ScyllaClusterManager):
+    """A tablet whose primary replica migrates away mid-upload must keep loading.
+
+    The primary is recorded per tablet as a host. A plain migration streams the tablet from the
+    leaving replica to the pending one, so the pending replica ends up with everything phase 1
+    put on the primary, and the coordinator moves the recorded primary along with it. It used
+    not to: the scheduler then found a primary that was no longer a replica and skipped the
+    tablet on every pass, so the request neither completed nor failed, and the table could not
+    be resized for as long as it lived.
+
+    Phase 2 is held failing so that a tablet sits in the replicating phase with a primary and no
+    transition in flight - the state in which a migration can take its primary away.
+    """
+    servers = await three_rack_servers(manager)
+    # Uploads are still scheduled with balancing off; this only keeps other moves out of the way.
+    await manager.disable_tablet_balancing()
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                          "'replication_factor': 2}") as ks:
+        cf = 'cf'
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                            f"WITH tablets = {{'min_tablet_count': 2}}")
+        await populate(cql, ks, cf)
+
+        tmpname = f'up-{uuid.uuid4().hex[:8]}'
+        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+        await plant_upload_dirs(saved)
+
+        injection = "upload_replicate_fail"
+        for s in servers:
+            await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
+
+        hosts = {str(await manager.get_host_id(s.server_id)): s for s in servers}
+        upload = asyncio.create_task(
+            manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=300))
+        try:
+            async def replicating():
+                rows = await cql.run_async("SELECT tablet_id, primary_host, phase "
+                                           "FROM system.upload_tablet_state")
+                held = [r for r in rows if r.phase == 'replicating' and r.primary_host is not None]
+                return held[0] if held else None
+            st = await wait_for(replicating, time.time() + 120, period=0.5)
+            tablet_id, primary = st.tablet_id, str(st.primary_host)
+
+            # Tablet ids are positions in token order, which is how system.tablets lists them.
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, cf)
+            tablet = tablets[tablet_id]
+            replicas = {str(h): shard for h, shard in tablet.replicas}
+            assert primary in replicas, f"recorded primary {primary} is not a replica: {replicas}"
+            dst = next(h for h in hosts if h not in replicas)
+            logger.info(f"moving tablet {tablet_id} from its upload primary {primary} to {dst}")
+
+            # The move is refused while a retry of the replication is in flight; try until it is not.
+            async def moved():
+                try:
+                    await manager.api.move_tablet(servers[0].ip_addr, ks, cf, primary, replicas[primary],
+                                                  dst, 0, tablet.last_token, timeout=120)
+                    return True
+                except Exception as e:
+                    logger.info(f"move_tablet not accepted yet: {e}")
+                    return None
+            await wait_for(moved, time.time() + 180, period=1)
+
+            async def landed():
+                now = await get_all_tablet_replicas(manager, servers[0], ks, cf)
+                hs = {str(h) for h, _ in now[tablet_id].replicas}
+                return True if dst in hs and primary not in hs else None
+            await wait_for(landed, time.time() + 60, period=0.5)
+
+            await read_barrier(manager.api, servers[0].ip_addr)
+            rows = await cql.run_async("SELECT tablet_id, primary_host FROM system.upload_tablet_state")
+            row = next(r for r in rows if r.tablet_id == tablet_id)
+            assert str(row.primary_host) == dst, \
+                f"the recorded primary did not follow the migration: {row.primary_host} != {dst}"
+        finally:
+            for s in servers:
+                try:
+                    await manager.api.disable_injection(s.ip_addr, injection)
+                except Exception:
+                    pass
+
+        await upload
+
+        got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
+        assert got == {str(k) for k in range(KEYS)}
+        leftover = await cql.run_async("SELECT tablet_id FROM system.upload_tablet_state")
+        assert not leftover, f"{len(leftover)} tablets still tracked after completion"
+        await wait_for_upload_dirs_empty(saved)
