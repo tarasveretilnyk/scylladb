@@ -27,7 +27,7 @@ from test.cluster.util import (get_topology_coordinator, new_test_keyspace,
                                trigger_snapshot)
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.rest_client import HTTPError, read_barrier
-from test.pylib.tablets import get_all_tablet_replicas, get_base_table
+from test.pylib.tablets import get_all_tablet_replicas, get_base_table, get_tablet_count
 from test.pylib.util import wait_for, wait_for_cql_and_get_hosts
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,32 @@ KEYS = 2048
 
 # Wake the load balancer every second (default 60s) so tablet splits and migrations finalize fast.
 BALANCER_CFG = {'tablet_load_stats_refresh_interval_in_seconds': 1}
+
+
+def start_releasing(manager, servers, injection):
+    """Messages a held injection on every server until the returned task is cancelled."""
+    async def release():
+        while True:
+            for s in servers:
+                try:
+                    await manager.api.message_injection(s.ip_addr, injection)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+    return asyncio.create_task(release())
+
+
+async def stage_upload(manager, cql, servers, ks, cf='cf', min_tablets=8):
+    """The suite's canonical arrangement: create the table, populate it, snapshot every node,
+    truncate, and plant each node's snapshot in its own upload directory."""
+    await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
+                        f"WITH tablets = {{'min_tablet_count': {min_tablets}}}")
+    await populate(cql, ks, cf)
+    tmpname = f'up-{uuid.uuid4().hex[:8]}'
+    saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
+    await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
+    await plant_upload_dirs(saved)
+    return saved
 
 
 async def populate(cql, ks, cf):
@@ -117,20 +143,6 @@ async def upload_dir_files(saved):
     return present
 
 
-async def table_id_of(cql, ks, cf):
-    """CQL has no subqueries, so the table id has to be looked up separately."""
-    rows = await cql.run_async(f"SELECT id FROM system_schema.tables WHERE "
-                               f"keyspace_name = '{ks}' AND table_name = '{cf}'")
-    return rows[0].id
-
-
-async def tablet_count(manager, cql, ks, cf):
-    await read_barrier(manager.api, (await manager.running_servers())[0].ip_addr)
-    tid = await table_id_of(cql, ks, cf)
-    rows = await cql.run_async(f"SELECT tablet_count FROM system.tablets WHERE table_id = {tid}")
-    return rows[0].tablet_count if rows else None
-
-
 @pytest.mark.asyncio
 async def test_cluster_upload_loads_all_data(manager: ScyllaClusterManager):
     """A single cluster upload call consumes every node's upload directory.
@@ -187,20 +199,13 @@ async def test_cluster_upload_uses_tablet_transitions(manager: ScyllaClusterMana
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         injection = "upload_tablet_before_transport"
         for s in servers:
             await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         upload = asyncio.create_task(
             manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180))
 
@@ -211,16 +216,7 @@ async def test_cluster_upload_uses_tablet_transitions(manager: ScyllaClusterMana
                 return True if any(r.stage == 'upload' for r in rows) else None
             await wait_for(upload_stage_seen, time.time() + 60, period=0.2)
 
-            async def release():
-                while True:
-                    for s in servers:
-                        try:
-                            await manager.api.message_injection(s.ip_addr, injection)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
-
-            releaser = asyncio.create_task(release())
+            releaser = start_releasing(manager, servers, injection)
             await upload
         finally:
             if releaser:
@@ -256,14 +252,7 @@ async def test_cluster_upload_and_node_join_complete_together(manager: ScyllaClu
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         upload = asyncio.create_task(
             manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=120))
@@ -275,17 +264,13 @@ async def test_cluster_upload_and_node_join_complete_together(manager: ScyllaClu
         got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
         assert got == {str(k) for k in range(KEYS)}
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         host_id = await manager.get_host_id(new_server.server_id)
 
         async def new_node_owns_tablets():
-            rows = await cql.run_async(
-                f"SELECT replicas FROM system.tablets WHERE table_id = {tid}")
-            for row in rows:
-                for replica in (row.replicas or []):
-                    if str(replica[0]) == str(host_id):
-                        return True
-            return None
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, cf)
+            owns = any(str(h) == str(host_id) for t in tablets for h, _ in t.replicas)
+            return True if owns else None
 
         # wait_for() compares against time.time(), so the deadline has to share that epoch.
         await wait_for(new_node_owns_tablets, time.time() + 90, period=1)
@@ -316,14 +301,7 @@ async def test_cluster_upload_load_is_not_charged_to_the_migration_budget(manage
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 32}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=32)
 
         logs = [await manager.server_open_log(s.server_id) for s in servers]
         marks = [await lg.mark() for lg in logs]
@@ -368,14 +346,7 @@ async def test_cluster_upload_fails_when_a_source_node_is_removed(manager: Scyll
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         victim = servers[2]
         victim_host = await manager.get_host_id(victim.server_id)
@@ -513,20 +484,12 @@ async def test_cluster_upload_pre_sizes_table(manager: ScyllaClusterManager):
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 2}}")
-        await populate(cql, ks, cf)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=2)
 
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
-
-        before = await tablet_count(manager, cql, ks, cf)
+        before = await get_tablet_count(manager, servers[0], ks, cf)
         await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, tablet_count=16, timeout=120)
-        after = await tablet_count(manager, cql, ks, cf)
+        after = await get_tablet_count(manager, servers[0], ks, cf)
 
-        assert before is not None and after is not None
         assert after >= 16, f"table was not pre-sized: {before} -> {after}"
 
         got = {row.pk for row in await cql.run_async(f"SELECT pk FROM {ks}.{cf}")}
@@ -588,32 +551,15 @@ async def test_cluster_upload_work_drains_across_tablets(manager: ScyllaClusterM
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         injection = "upload_tablet_before_transport"
         for s in servers:
             await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         upload = asyncio.create_task(
             manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=120))
-
-        # Release the held batches in the background; without this the injection stalls it forever.
-        async def release():
-            while True:
-                for s in servers:
-                    try:
-                        await manager.api.message_injection(s.ip_addr, injection)
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.05)
 
         peak = 0
 
@@ -638,7 +584,8 @@ async def test_cluster_upload_work_drains_across_tablets(manager: ScyllaClusterM
         except Exception:
             logger.warning("never saw more than one held transition; the assertion below will say so")
 
-        releaser = asyncio.create_task(release())
+        # Release the held batches; without this the injection stalls the load forever.
+        releaser = start_releasing(manager, servers, injection)
 
         try:
             await upload
@@ -679,14 +626,7 @@ async def test_cluster_upload_abort(manager: ScyllaClusterManager):
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
         planted = await upload_dir_files(saved)
         assert planted, "nothing was planted, so the rest of this test would prove nothing"
 
@@ -694,7 +634,7 @@ async def test_cluster_upload_abort(manager: ScyllaClusterManager):
         for s in servers:
             await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         upload = asyncio.create_task(
             manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180))
 
@@ -707,16 +647,7 @@ async def test_cluster_upload_abort(manager: ScyllaClusterManager):
             await wait_for(transitions_parked, time.time() + 60, period=0.1)
             await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
 
-            async def release():
-                while True:
-                    for s in servers:
-                        try:
-                            await manager.api.message_injection(s.ip_addr, injection)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
-
-            releaser = asyncio.create_task(release())
+            releaser = start_releasing(manager, servers, injection)
 
             # The abort is the outcome: success would let teardown delete sstables never loaded.
             with pytest.raises(Exception):
@@ -767,20 +698,13 @@ async def test_cluster_upload_abort_interrupts_streaming(manager: ScyllaClusterM
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         injection = "upload_tablet_before_transport"
         for s in servers:
             await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         logs = [await manager.server_open_log(s.server_id) for s in servers]
         marks = [await lg.mark() for lg in logs]
 
@@ -798,16 +722,7 @@ async def test_cluster_upload_abort_interrupts_streaming(manager: ScyllaClusterM
             # Abort while transfers are held: each session is closed, so its abort source has fired.
             await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
 
-            async def release():
-                while True:
-                    for s in servers:
-                        try:
-                            await manager.api.message_injection(s.ip_addr, injection)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
-
-            releaser = asyncio.create_task(release())
+            releaser = start_releasing(manager, servers, injection)
 
             try:
                 await upload
@@ -867,14 +782,7 @@ async def test_cluster_upload_replicates_to_all_replicas(manager: ScyllaClusterM
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
 
         # Watch the coordinator log so replication is shown, not inferred from a successful read.
         coord_log = await manager.server_open_log(servers[0].server_id)
@@ -917,14 +825,7 @@ async def test_cluster_upload_retries_failed_replication(manager: ScyllaClusterM
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
 
         # One shot per node: each fails its first replication, so the load must recover.
         injection = "upload_replicate_fail"
@@ -969,14 +870,7 @@ async def test_cluster_upload_primary_replica_only(manager: ScyllaClusterManager
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
 
         coord_log = await manager.server_open_log(servers[0].server_id)
         log_mark = await coord_log.mark()
@@ -1077,14 +971,7 @@ async def test_cluster_upload_multi_dc_asymmetric_rf(manager: ScyllaClusterManag
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'dc1': 3, 'dc2': 2}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         coord_log = await manager.server_open_log(servers[0].server_id)
         log_mark = await coord_log.mark()
@@ -1122,14 +1009,7 @@ async def test_cluster_upload_uses_both_transport_paths(manager: ScyllaClusterMa
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         # The per-tablet executor lines this test greps for are debug level.
         for s in servers:
@@ -1219,14 +1099,7 @@ async def test_cluster_upload_reports_metrics(manager: ScyllaClusterManager):
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
 
         await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180)
 
@@ -1295,14 +1168,7 @@ async def test_cluster_upload_rejects_second_request_for_same_table(manager: Scy
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
 
         # Both must succeed - the second joins the first - and the data must be loaded once.
         await asyncio.gather(
@@ -1333,14 +1199,7 @@ async def test_cluster_upload_survives_coordinator_restart(manager: ScyllaCluste
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
 
         leader_host = await manager.api.get_raft_leader(servers[0].ip_addr)
         leader = await manager.find_server_by_host_id(servers, leader_host)
@@ -1437,14 +1296,7 @@ async def test_cluster_upload_abort_while_preparing(manager: ScyllaClusterManage
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 16}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=16)
         planted = await upload_dir_files(saved)
         assert planted, "nothing was planted, so the rest of this test would prove nothing"
 
@@ -1452,7 +1304,7 @@ async def test_cluster_upload_abort_while_preparing(manager: ScyllaClusterManage
         for s in servers:
             await manager.api.enable_injection(s.ip_addr, injection, one_shot=False)
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         upload = asyncio.create_task(
             manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf, timeout=180))
 
@@ -1473,16 +1325,7 @@ async def test_cluster_upload_abort_while_preparing(manager: ScyllaClusterManage
             await wait_for(preparing, time.time() + 60, period=0.1)
             await manager.api.tablets_upload_abort(servers[0].ip_addr, ks, cf, timeout=60)
 
-            async def release():
-                while True:
-                    for s in servers:
-                        try:
-                            await manager.api.message_injection(s.ip_addr, injection)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
-
-            releaser = asyncio.create_task(release())
+            releaser = start_releasing(manager, servers, injection)
 
             with pytest.raises(Exception) as excinfo:
                 await upload
@@ -1530,14 +1373,7 @@ async def test_cluster_upload_abort_before_request_exists(manager: ScyllaCluster
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 1}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
         planted = await upload_dir_files(saved)
         assert planted, "nothing was planted, so the rest of this test would prove nothing"
 
@@ -1566,7 +1402,7 @@ async def test_cluster_upload_abort_before_request_exists(manager: ScyllaCluster
         assert 'abort' in status['error'].lower(), \
             f"the task did not fail with the abort as its reason: {status['error']}"
 
-        tid = await table_id_of(cql, ks, cf)
+        tid = await manager.get_table_id(ks, cf)
         rows = await cql.run_async("SELECT upload_table_id, done FROM system.topology_requests "
                                    "ALLOW FILTERING")
         assert not [r for r in rows if getattr(r, 'upload_table_id', None) == tid and not r.done], \
@@ -1737,14 +1573,7 @@ async def test_cluster_upload_accepts_numeric_generations(manager: ScyllaCluster
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 3}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 8}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=8)
 
         # Cassandra writes numeric generations (me-1-big-Data.db); the upload dir takes them as-is.
         renamed = 0
@@ -1813,7 +1642,7 @@ async def test_cluster_upload_tablet_with_no_partitions_in_its_slice(manager: Sc
         await manager.api.tablets_upload_and_wait(servers[0].ip_addr, ks, cf,
                                                   tablet_count=32, timeout=240)
 
-        assert await tablet_count(manager, cql, ks, cf) >= 32
+        assert await get_tablet_count(manager, servers[0], ks, cf) >= 32
         stmt = cql.prepare(f"SELECT pk FROM {ks}.{cf}")
         stmt.consistency_level = ConsistencyLevel.ONE
         got = {row.pk for row in await cql.run_async(stmt)}
@@ -1933,6 +1762,7 @@ async def test_cluster_upload_state_survives_raft_snapshot(manager: ScyllaCluste
 
         await wait_for_upload_dirs_empty(dc1_saved)
 
+
 @pytest.mark.asyncio
 async def test_cluster_upload_primary_follows_migration(manager: ScyllaClusterManager):
     """A tablet whose primary replica migrates away mid-upload must keep loading.
@@ -1955,14 +1785,7 @@ async def test_cluster_upload_primary_follows_migration(manager: ScyllaClusterMa
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
                                           "'replication_factor': 2}") as ks:
         cf = 'cf'
-        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk text primary key, value int) "
-                            f"WITH tablets = {{'min_tablet_count': 2}}")
-        await populate(cql, ks, cf)
-
-        tmpname = f'up-{uuid.uuid4().hex[:8]}'
-        saved = await snapshot_to_tmp(manager, servers, ks, cf, tmpname)
-        await cql.run_async(f"TRUNCATE TABLE {ks}.{cf}")
-        await plant_upload_dirs(saved)
+        saved = await stage_upload(manager, cql, servers, ks, cf, min_tablets=2)
 
         injection = "upload_replicate_fail"
         for s in servers:
