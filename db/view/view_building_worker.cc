@@ -275,27 +275,48 @@ future<std::vector<foreign_ptr<semaphore_units<>>>> view_building_worker::lock_s
 }
 
 future<> view_building_worker::create_staging_sstable_tasks() {
-    // Explicitly lock shard0 beforehand to prevent other shards from modifying `_sstables_to_register` from `register_staging_sstable_tasks()`
-    auto lock0 = co_await get_units(_staging_sstables_mutex, 1, _as);
-
-    if (_sstables_to_register.empty()) {
-        co_return;
+    // Snapshot the registration queue and release the lock before anything group0-shaped runs:
+    // a group0 guard must never be acquired while a vbw mutex is held. start_operation() pins
+    // the group0 read-apply mutex, and the view building state observer holds that mutex while
+    // it aborts batches - and an aborting batch can be parked in do_process_staging() on
+    // `_staging_sstables_mutex`. Taking the guard under these locks closes that loop into a
+    // node-wide deadlock of group0 apply, and of every barrier behind it (SCYLLADB-3350 upload
+    // hit this constantly, since every upload transition both registers staging sstables and
+    // commits view-building state changes).
+    decltype(_sstables_to_register) to_register;
+    {
+        auto lock0 = co_await get_units(_staging_sstables_mutex, 1, _as);
+        if (_sstables_to_register.empty()) {
+            co_return;
+        }
+        to_register = std::exchange(_sstables_to_register, {});
     }
+    // Entries registered from here on queue up for the next iteration. If anything below fails,
+    // the snapshot is spliced back so no registration is lost.
+    auto requeue = seastar::defer([&] () noexcept {
+        for (auto& [table_id, sst_infos]: to_register) {
+            if (sst_infos.empty()) {
+                continue;
+            }
+            auto& q = _sstables_to_register[table_id];
+            q.insert(q.begin(), std::make_move_iterator(sst_infos.begin()), std::make_move_iterator(sst_infos.end()));
+        }
+    });
 
-    auto shards = _sstables_to_register 
-        | std::views::values 
-        | std::views::join 
-        | std::views::transform([] (const auto& sst_info) { return sst_info.shard; }) 
+    // The shards whose staging lists the committed snapshot lands on; locked only for the
+    // redistribution at the end.
+    auto shards = to_register
+        | std::views::values
+        | std::views::join
+        | std::views::transform([] (const auto& sst_info) { return sst_info.shard; })
         | std::ranges::to<std::flat_set<shard_id>>();
-    shards.erase(0); // We're already holding shard0 lock
-    auto locks = co_await lock_staging_mutex_on_multiple_shards(std::move(shards));
 
     auto guard = co_await _group0.client().start_operation(_as);
     auto uuid_gen = _vb_state_machine.building_state.make_task_uuid_generator(guard.write_timestamp());
     view_building_task_mutation_builder builder(guard.write_timestamp(), std::move(uuid_gen));
     auto my_host_id = _db.get_token_metadata().get_topology().my_host_id();
     auto started_tasks_lock = co_await get_units(_started_staging_tasks_mutex, 1, _as);
-    for (auto& [table_id, sst_infos]: _sstables_to_register) {
+    for (auto& [table_id, sst_infos]: to_register) {
         std::set<std::pair<shard_id, dht::token>> new_tasks;
         auto task_exists = [&, this] (shard_id shard, dht::token last_token) {
             if (new_tasks.contains({shard, last_token})) {
@@ -352,17 +373,19 @@ future<> view_building_worker::create_staging_sstable_tasks() {
     auto cmd = _group0.client().prepare_command(service::write_mutations{std::move(cmuts)}, guard, "create view building tasks");
     co_await _group0.client().add_entry(std::move(cmd), std::move(guard), _as);
 
-    // Move staging sstables from `_sstables_to_register` (on shard0) to `_staging_sstables` on corresponding shards.
-    // Firstly reorgenize `_sstables_to_register` for easier movement.
-    // This is done in separate loop after committing the group0 command, because we need to move values from `_sstables_to_register`
-    // (`staging_sstable_task_info` is non-copyable because of `foreign_ptr` field).
+    // Committed: move the snapshot's sstables to `_staging_sstables` on their shards. Reorganized
+    // per shard first (`staging_sstable_task_info` is non-copyable because of the foreign_ptr).
     std::unordered_map<shard_id, std::unordered_map<table_id, std::vector<foreign_ptr<sstables::shared_sstable>>>> new_sstables_per_shard;
-    for (auto& [table_id, sst_infos]: _sstables_to_register) {
+    for (auto& [table_id, sst_infos]: to_register) {
         for (auto& sst_info: sst_infos) {
             new_sstables_per_shard[sst_info.shard][table_id].push_back(std::move(sst_info.sst_foreign_ptr));
         }
     }
+    // Consumed: nothing to requeue from here on, whatever happens below.
+    to_register.clear();
 
+    // Locked so do_process_staging() and cleanup never observe a staging list mid-move.
+    auto locks = co_await lock_staging_mutex_on_multiple_shards(std::move(shards));
     for (auto& [shard, sstables_per_table]: new_sstables_per_shard) {
         co_await container().invoke_on(shard, [sstables_for_this_shard = std::move(sstables_per_table)] (view_building_worker& local_vbw) mutable {
             for (auto& [tid, ssts]: sstables_for_this_shard) {
@@ -374,9 +397,7 @@ future<> view_building_worker::create_staging_sstable_tasks() {
             }
         });
     }
-    _sstables_to_register.clear();
 }
-
 future<> view_building_worker::discover_existing_staging_sstables() {
     auto merge_maps = [] (auto& a, auto&& b) mutable {
         for (auto& [tid, ssts]: b) {
