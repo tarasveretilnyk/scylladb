@@ -865,6 +865,51 @@ async def test_migration_overlapping_migrations(manager: ScyllaClusterManager):
         await manager.api.finalize_vnode_tablet_migration(server.ip_addr, ks1)
 
 
+async def test_migration_drop_table_leaves_tablet_map(manager: ScyllaClusterManager):
+    """Verify that dropping a table from a migrating keyspace drops its tablet map.
+
+    A table which is being migrated from vnodes to tablets has a tablet map
+    while its keyspace replication strategy still uses vnodes. Dropping such a
+    table must remove its tablet map, otherwise the map is orphaned in
+    system.tablets forever: neither finalization nor rollback of the migration
+    removes it, because both only consider the tables which are still in the
+    keyspace.
+
+    An orphaned tablet map is not inert. The load balancer cannot migrate its
+    tablets, because the table has no schema anymore, but it still counts them
+    as load on their replicas. Draining any of those nodes therefore never
+    completes, which makes decommission and removenode fail and replace hang.
+    """
+    server, cql = await setup_single_node(manager)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'enabled': false}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.t1 (pk int PRIMARY KEY)")
+        await cql.run_async(f"CREATE TABLE {ks}.t2 (pk int PRIMARY KEY)")
+
+        logger.info("Starting vnodes-to-tablets migration (creating tablet maps)")
+        await manager.api.create_vnode_tablet_migration(server.ip_addr, ks)
+
+        # Remember the table id while the table still exists in the schema.
+        t2_id = await manager.get_table_id(ks, 't2')
+
+        await read_barrier(manager.api, server.ip_addr)
+        rows = await cql.run_async(f"SELECT last_token FROM system.tablets WHERE table_id = {t2_id}")
+        assert len(rows) > 0, f"migration did not create a tablet map for {ks}.t2"
+
+        logger.info(f"Dropping {ks}.t2 while the keyspace is still using vnodes")
+        await cql.run_async(f"DROP TABLE {ks}.t2")
+
+        await read_barrier(manager.api, server.ip_addr)
+        rows = await cql.run_async(f"SELECT last_token FROM system.tablets WHERE table_id = {t2_id}")
+        assert len(rows) == 0, \
+            f"{ks}.t2 was dropped but left {len(rows)} tablet map row(s) behind in " \
+            f"system.tablets (table_id={t2_id})"
+
+        # Roll the migration back so that the keyspace can be dropped cleanly.
+        await manager.api.downgrade_node_to_vnodes(server.ip_addr)
+        await manager.api.finalize_vnode_tablet_migration(server.ip_addr, ks)
+
+
 async def test_migration_finalize_before_upgrade(manager: ScyllaClusterManager):
     """Verify that finalizing migration before the node has finished upgrading fails."""
     server, cql = await setup_single_node(manager)
