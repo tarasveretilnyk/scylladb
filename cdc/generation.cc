@@ -582,13 +582,19 @@ future<> generation_service::query_cdc_timestamps(table_id table, bool ascending
     const auto table_streams_ptr = table_it->second; // keep alive
     const auto& table_streams = *table_streams_ptr;
 
+    // The vnode streams set of a migrated table isn't a stream set the table's
+    // log writes use, so it isn't published.
     if (ascending) {
         for (auto it = table_streams.cbegin(); it != table_streams.cend(); ++it) {
-            co_await f(it->second.ts);
+            if (!is_vnode_streams_set(it->second)) {
+                co_await f(it->second.ts);
+            }
         }
     } else {
         for (auto it = table_streams.crbegin(); it != table_streams.crend(); ++it) {
-            co_await f(it->second.ts);
+            if (!is_vnode_streams_set(it->second)) {
+                co_await f(it->second.ts);
+            }
         }
     }
 }
@@ -604,6 +610,11 @@ future<> generation_service::query_cdc_streams(table_id table, noncopyable_funct
 
     auto it_prev = table_streams.end();
     auto it = table_streams.begin();
+    // Not published, see query_cdc_timestamps(). The first published set
+    // is then reported as opening all its streams.
+    if (it != table_streams.end() && is_vnode_streams_set(it->second)) {
+        ++it;
+    }
     while (it != table_streams.end()) {
         const auto& entry = it->second;
 
