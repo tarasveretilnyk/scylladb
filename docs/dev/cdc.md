@@ -339,6 +339,12 @@ These tables are used internally by ScyllaDB to manage the lifecycle and state o
 - **`system.cdc_streams_history`**:
   Whenever the set of streams for a table changes, a new timestamp and the difference from the previous state (opened and closed streams) are appended to this table. Each entry records which streams were opened or closed at a given timestamp, allowing reconstruction of the stream set at any point in time.
 
+#### Migration from vnodes
+
+A table of a keyspace migrated from vnodes to tablets used the vnode-based CDC generations before the migration. Preparing the migration co-locates its CDC log table with it and gives the log table the *vnode streams set*: a stream set whose timestamp is the unix epoch (`cdc::vnode_streams_timestamp`), standing for "until the next stream set, use the vnode-based CDC generations". Its streams are those of the table's tablets, but they're never written to: a stream set can't be stored without streams. Writes keep using the vnode-based generations while the keyspace uses vnodes, and a node that applied the schema change of the finalization, but not yet the switch it carries, keeps using them too.
+
+Finalizing the migration appends the switch to the table's tablet streams to `cdc_streams_history`, in the same group0 command as the `ALTER KEYSPACE`. Like the switch of a tablet resize, it starts operating `2 * ring_delay + 5s` later (immediately if `ring_delay` is 0, as in tests), so that every node knows about it in time. Writes with earlier timestamps that arrive later are treated like writes to a previous generation (see "Writes to the previous generations"). The virtual tables don't list the vnode streams set, so the switch is the table's first stream set there. The stream GC removes the vnode streams set once the switch is older than the CDC TTL. Rolling the migration back drops the stream state.
+
 #### Virtual tables
 
 These virtual tables present the CDC stream information in a user-friendly format, allowing CDC consumers to efficiently discover available streams and their validity intervals.
