@@ -28,6 +28,7 @@
 #include "cdc/cdc_options.hh"
 #include "cdc/generation.hh"
 #include "cdc/generation_service.hh"
+#include "cdc/log.hh"
 #include "cql3/statements/ks_prop_defs.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/system_keyspace.hh"
@@ -1882,6 +1883,30 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                             }
                         }
 
+                        // Switch the CDC log tables from the vnode-based CDC
+                        // generations to their tablet streams. The switch is
+                        // applied in the same command as the ALTER below, but
+                        // takes effect a bit later, at the same time on all
+                        // nodes, so that the CDC events of every partition are
+                        // in vnode streams before the switch and in tablet
+                        // streams after it. A migration prepared by a version
+                        // that didn't support CDC tables gave the log tables
+                        // tablet maps of their own and no CDC stream state.
+                        for (const auto& table : old_md->tables()) {
+                            if (!cdc::is_log_schema(*table)) {
+                                continue;
+                            }
+                            if (tablet_metadata.is_base_table(table->id())
+                                    || !_cdc_gens.get_cdc_metadata().has_only_vnode_streams_set(table->id())) {
+                                throw std::runtime_error(fmt::format(
+                                    "CDC log table {}.{} was prepared for the migration by a version that didn't support"
+                                    " CDC tables. Roll the migration back and start it again.",
+                                    ks_name, table->cf_name()));
+                            }
+                            co_await _cdc_gens.generate_vnodes_to_tablets_switch(updates, table->id(),
+                                    tablet_metadata.get_tablet_map(table->id()), guard.write_timestamp());
+                        }
+
                         // All nodes have been migrated. ALTER the keyspace to use tablets.
                         auto new_md = data_dictionary::keyspace_metadata::new_keyspace(
                             old_md->name(),
@@ -1903,9 +1928,16 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                             updates.emplace_back(m);
                         }
                     } else {
-                        // Rollback: delete tablet maps for all tables in the keyspace.
+                        // Rollback: delete tablet maps for all tables in the keyspace,
+                        // and the CDC stream state that preparing the migration gave
+                        // to CDC log tables.
                         for (const auto& schema : tables) {
                             updates.emplace_back(replica::make_drop_tablet_map_mutation(schema->id(), guard.write_timestamp()));
+                            if (cdc::is_log_schema(*schema)) {
+                                for (auto& m : cdc::make_drop_table_streams_mutations(schema->id(), guard.write_timestamp())) {
+                                    updates.emplace_back(m);
+                                }
+                            }
                         }
                     }
                 } catch (const std::exception& e) {

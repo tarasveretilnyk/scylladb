@@ -9,7 +9,11 @@
 #undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 
+#include "cdc/generation.hh"
+#include "cdc/generation_service.hh"
+#include "cdc/log.hh"
 #include "db/config.hh"
+#include "test/lib/cql_assertions.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/exception_utils.hh"
 #include "test/lib/topology_builder.hh"
@@ -928,6 +932,113 @@ SEASTAR_TEST_CASE(test_block_index_schema_changes_during_migration) {
         // Creating an index that already exists doesn't change the set of tables.
         e.execute_cql(format("CREATE INDEX IF NOT EXISTS local_idx ON {}.t ((pk), v)", ks)).get();
     });
+}
+
+// SCYLLADB-1166: preparing the migration of a keyspace with a CDC table
+// co-locates the CDC log table with its base table, as in a keyspace created
+// with tablets, and gives it the vnode streams set (one stream per tablet).
+// Until the migration is finalized, the log writes keep using the vnode-based
+// CDC generations, and the virtual tables don't publish the log's streams.
+SEASTAR_TEST_CASE(test_cdc_log_tablet_map_creation) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto ks_name = sstring("test_migration_ks");
+        create_vnode_keyspace_with_table(e, ks_name);
+        e.execute_cql(format("ALTER TABLE {}.t WITH cdc = {{'enabled': true}}", ks_name)).get();
+        auto base_id = e.local_db().find_schema(ks_name, "t")->id();
+        auto log_id = e.local_db().find_schema(ks_name, cdc::log_name("t"))->id();
+
+        e.get_storage_service().local().prepare_for_tablets_migration(ks_name).get();
+
+        const auto& tablets = e.local_db().get_shared_token_metadata().get()->tablets();
+        BOOST_REQUIRE(tablets.is_base_table(base_id));
+        BOOST_REQUIRE(tablets.get_base_table(log_id) == base_id);
+        BOOST_REQUIRE(&tablets.get_tablet_map(log_id) == &tablets.get_tablet_map(base_id));
+        auto tablet_count = tablets.get_tablet_map(base_id).tablet_count();
+
+        assert_that(e.execute_cql(format("SELECT DISTINCT timestamp FROM system.cdc_streams_state WHERE table_id = {}", log_id)).get())
+                .is_rows().with_rows({{timestamp_type->decompose(cdc::vnode_streams_timestamp)}});
+        auto streams = e.execute_cql(format("SELECT stream_id FROM system.cdc_streams_state WHERE table_id = {}", log_id)).get();
+        assert_that(streams).is_rows().with_size(tablet_count);
+        assert_that(e.execute_cql(format("SELECT * FROM system.cdc_timestamps WHERE keyspace_name = '{}' AND table_name = 't'", ks_name)).get())
+                .is_rows().is_empty();
+        assert_that(e.execute_cql(format("SELECT * FROM system.cdc_streams WHERE keyspace_name = '{}' AND table_name = 't'", ks_name)).get())
+                .is_rows().is_empty();
+
+        // The write goes to a vnode stream, not to a stream of the vnode
+        // streams set.
+        e.execute_cql(format("INSERT INTO {}.t (pk, v) VALUES (1, 1)", ks_name)).get();
+        auto log_rows = e.execute_cql(format("SELECT \"cdc$stream_id\" FROM {}.{}", ks_name, cdc::log_name("t"))).get();
+        assert_that(log_rows).is_rows().with_size(1);
+        auto rows_of = [] (const shared_ptr<cql_transport::messages::result_message>& msg) -> const auto& {
+            return dynamic_cast<cql_transport::messages::result_message::rows&>(*msg).rs().result_set().rows();
+        };
+        auto written_stream = rows_of(log_rows).front().front();
+        for (const auto& row : rows_of(streams)) {
+            BOOST_REQUIRE(row.front() != written_stream);
+        }
+    });
+}
+
+// SCYLLADB-1166: the migration can be prepared again until a node is marked
+// for upgrade. That replaces the vnode streams set of a CDC log table with
+// another one, with the same timestamp but other streams, which every node
+// must load. A node that kept the old one would switch the CDC log to other
+// tablet streams than a node that loads the stream state from scratch, e.g.
+// after a restart.
+SEASTAR_TEST_CASE(test_cdc_log_migration_prepared_again) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto ks_name = sstring("test_migration_ks");
+        create_vnode_keyspace_with_table(e, ks_name);
+        e.execute_cql(format("ALTER TABLE {}.t WITH cdc = {{'enabled': true}}", ks_name)).get();
+        auto log_id = e.local_db().find_schema(ks_name, cdc::log_name("t"))->id();
+
+        auto stored_streams = [&] {
+            auto msg = e.execute_cql(format("SELECT stream_id FROM system.cdc_streams_state WHERE table_id = {}", log_id)).get();
+            std::vector<cdc::stream_id> streams;
+            for (const auto& row : dynamic_cast<cql_transport::messages::result_message::rows&>(*msg).rs().result_set().rows()) {
+                streams.emplace_back(to_bytes(*row.front()));
+            }
+            return streams;
+        };
+        auto require_loaded = [&] (const std::vector<cdc::stream_id>& expected) {
+            for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+                auto loaded = e.get_cdc_generation_service().invoke_on(shard, [log_id] (cdc::generation_service& svc) {
+                    const auto& table_streams = *svc.get_cdc_metadata().get_all_tablet_streams().at(log_id);
+                    const auto& streams = table_streams.begin()->second.streams;
+                    return std::make_pair(table_streams.size(), std::vector<cdc::stream_id>(streams.begin(), streams.end()));
+                }).get();
+                BOOST_REQUIRE_EQUAL(loaded.first, 1u);
+                BOOST_REQUIRE(loaded.second == expected);
+            }
+        };
+
+        e.get_storage_service().local().prepare_for_tablets_migration(ks_name).get();
+        auto first = stored_streams();
+        require_loaded(first);
+
+        e.get_storage_service().local().prepare_for_tablets_migration(ks_name).get();
+        auto second = stored_streams();
+        // Stream ids have random bits.
+        BOOST_REQUIRE(second != first);
+        require_loaded(second);
+    });
+}
+
+// SCYLLADB-1166: nodes that don't support the migration of CDC tables don't
+// know that the vnode streams set stands for the vnode-based CDC generations,
+// so the migration of a keyspace with CDC tables waits until all nodes do.
+SEASTAR_TEST_CASE(test_prepare_rejects_cdc_tables_without_feature) {
+    cql_test_config cfg;
+    cfg.disabled_features.insert("CDC_VNODES_TO_TABLETS_MIGRATION");
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        create_vnode_keyspace_with_table(e, "test_cdc_ks");
+        e.execute_cql("ALTER TABLE test_cdc_ks.t WITH cdc = {'enabled': true}").get();
+        BOOST_REQUIRE_EXCEPTION(e.get_storage_service().local().prepare_for_tablets_migration("test_cdc_ks").get(),
+                std::runtime_error, exception_predicate::message_contains("not all nodes can migrate"));
+
+        create_vnode_keyspace_with_table(e, "test_migration_ks");
+        e.get_storage_service().local().prepare_for_tablets_migration("test_migration_ks").get();
+    }, cfg);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

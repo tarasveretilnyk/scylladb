@@ -71,6 +71,14 @@ public:
 
     future<> generate_tablet_resize_update(service::group0_update_collector& muts, table_id table, const locator::tablet_map& new_tablet_map, api::timestamp_type ts);
 
+    // Generates the switch of the CDC log table `table`, whose keyspace is being
+    // migrated from vnodes to tablets, from the vnode-based CDC generations to
+    // the table's tablet streams, given by `tablet_map`. Like the switch of a
+    // tablet resize, it starts operating in the near future, so that every node
+    // learns about it in time.
+    // Throws if the table doesn't have the vnode streams set as its only stream set.
+    future<> generate_vnodes_to_tablets_switch(utils::chunked_vector<canonical_mutation>& muts, table_id table, const locator::tablet_map& tablet_map, api::timestamp_type ts);
+
     // Check for tables with enable_requested CDC option and finalize their
     // stream enablement if no in-progress tablet merges remain.
     // Returns schema mutations that transition enable_requested -> enabled,

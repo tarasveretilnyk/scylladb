@@ -98,6 +98,7 @@
 #include <seastar/core/metrics.hh>
 #include "cdc/generation.hh"
 #include "cdc/generation_service.hh"
+#include "cdc/log.hh"
 #include "repair/repair.hh"
 #include "repair/row_level.hh"
 #include "gms/generation-number.hh"
@@ -4530,12 +4531,36 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
         validate_rf_for_tablets_migration(db, get_token_metadata_ptr(), *nts, ks_name);
         co_await validate_keyspace_views_for_tablets_migration(db, get_system_keyspace(), topology, ks_name);
 
+        // A CDC log table gets the vnode streams set (see
+        // cdc::vnode_streams_timestamp), which older nodes would take for a
+        // stream set of its own.
+        bool has_cdc_log_tables = std::ranges::any_of(cf_meta_data | std::views::values, [] (const schema_ptr& s) {
+            return cdc::is_log_schema(*s);
+        });
+        if (has_cdc_log_tables && (!_feature_service.cdc_vnodes_to_tablets_migration || !_feature_service.cdc_with_tablets)) {
+            throw std::runtime_error(fmt::format(
+                    "Cannot migrate keyspace {} to tablets: it has CDC log tables, which not all nodes can migrate."
+                    " Finish upgrading the cluster and retry.", ks_name));
+        }
+        // CDC log tables will be co-located with their base tables, and
+        // co-located tables don't support the 'repair' tombstone_gc mode. CQL
+        // rejects it for CDC log tables, but older versions didn't.
+        for (const auto& s : cf_meta_data | std::views::values) {
+            if (cdc::is_log_schema(*s) && s->tombstone_gc_options().mode() == tombstone_gc_mode::repair) {
+                throw std::runtime_error(fmt::format(
+                        "Cannot migrate keyspace {} to tablets: CDC log table {}.{} uses the 'repair' tombstone_gc mode,"
+                        " which CDC log tables don't support. Switch it to 'timeout' with ALTER TABLE and retry.",
+                        ks_name, ks_name, s->cf_name()));
+            }
+        }
+
         // Tables that get a tablet map of their own: base tables, and views
         // that cannot be co-located with their base table.
         std::vector<std::pair<table_id, sstring>> tables_to_build_maps;
         // Tables that share the tablet map of another table, keyed by the
-        // table whose map they share. Currently, these are views co-located
-        // with their base table.
+        // table whose map they share: views co-located with their base table,
+        // and CDC log tables, which are always co-located with their base
+        // table, as in a keyspace created with tablets.
         std::unordered_map<table_id, std::vector<std::pair<table_id, sstring>>> tables_to_colocate;
 
         for (const auto& [name, schema] : cf_meta_data) {
@@ -4546,7 +4571,8 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
                 slogger.info("{} {}.{} already uses tablets, skipping", schema->is_view() ? "View" : "Table", ks_name, name);
                 continue;
             }
-            if (auto base_id = schema->is_view() ? db.get_base_table_for_tablet_colocation(*schema, {}) : std::nullopt) {
+            bool may_colocate = schema->is_view() || cdc::is_log_schema(*schema);
+            if (auto base_id = may_colocate ? db.get_base_table_for_tablet_colocation(*schema, {}) : std::nullopt) {
                 tables_to_colocate[*base_id].push_back({tid, name});
             } else {
                 tables_to_build_maps.push_back({tid, name});
@@ -4659,7 +4685,12 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
             // Co-located tables don't get a tablet map of their own; instead,
             // they are registered in system.tablets as co-located with the
             // table whose tablet map they share.
-            auto append_colocated_tablet_map_mutations = [&] (table_id base_id) -> future<> {
+            //
+            // A CDC log table also gets its CDC stream state: the vnode streams
+            // set, whose streams are those of the tablets of `base_map`. Its
+            // writes keep using the vnode-based CDC generations until
+            // finalization switches it to its tablet streams.
+            auto append_colocated_tablet_map_mutations = [&] (table_id base_id, const locator::tablet_map& base_map) -> future<> {
                 auto it = tables_to_colocate.find(base_id);
                 if (it == tables_to_colocate.end()) {
                     co_return;
@@ -4669,6 +4700,16 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
                                  ks_name, cf_name, base_id);
                     auto m = replica::colocated_tablet_map_to_mutation(tid, ks_name, cf_name, base_id, guard.write_timestamp());
                     updates.emplace_back(co_await make_canonical_mutation_gently(std::move(m)));
+                    if (cdc::is_log_schema(*db.find_schema(tid))) {
+                        // Replaces the stream state of an earlier preparation:
+                        // the migration can be prepared again until a node is
+                        // marked for upgrade.
+                        for (const auto& drop_m : cdc::make_drop_table_streams_mutations(tid, guard.write_timestamp() - 1)) {
+                            updates.emplace_back(co_await make_canonical_mutation_gently(drop_m));
+                        }
+                        auto streams_m = co_await cdc::create_table_streams_mutation(tid, cdc::vnode_streams_timestamp, base_map, guard.write_timestamp());
+                        updates.emplace_back(co_await make_canonical_mutation_gently(std::move(streams_m)));
+                    }
                 }
             };
 
@@ -4680,13 +4721,13 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
                     }
                     auto tmap = co_await build_tablet_map_for_migration(erm, target_pow2);
                     co_await append_tablet_map_mutations(tid, cf_name, tmap, target_pow2);
-                    co_await append_colocated_tablet_map_mutations(tid);
+                    co_await append_colocated_tablet_map_mutations(tid, tmap);
                 }
             } else {
                 auto shared_tmap = co_await build_tablet_map_for_migration(erm, 0);
                 for (const auto& [tid, cf_name] : tables_to_build_maps) {
                     co_await append_tablet_map_mutations(tid, cf_name, shared_tmap, 0);
-                    co_await append_colocated_tablet_map_mutations(tid);
+                    co_await append_colocated_tablet_map_mutations(tid, shared_tmap);
                 }
             }
         }

@@ -14,6 +14,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include "keys/keys.hh"
+#include "mutation/async_utils.hh"
 #include "replica/database.hh"
 #include "db/system_keyspace.hh"
 #include "db/schema_tables.hh"
@@ -522,15 +523,18 @@ future<> generation_service::load_cdc_tablet_streams(std::optional<std::unordere
             new_table_map[ts] = committed_stream_set {stream_tp, std::move(stream_set)};
         };
 
-        // if we already have a loaded streams map, and the base timestamp is unchanged, then read
+        // if we already have a loaded streams map, and the base stream set is unchanged, then read
         // the history entries starting from the latest one we have and append it to the existing map.
         // we can do it because we only append new rows with higher timestamps to the history table.
+        // the base timestamp alone doesn't tell: preparing the migration of a keyspace from vnodes to
+        // tablets again replaces the vnode streams set with another one with the same timestamp.
         std::optional<std::reference_wrapper<const committed_stream_set>> from_streams;
         std::optional<db_clock::time_point> from_ts;
         const auto& all_streams = _cdc_metadata.get_all_tablet_streams();
         if (auto it = all_streams.find(table); it != all_streams.end()) {
             const auto& current_map = *it->second;
-            if (current_map.cbegin()->second.ts == base_ts) {
+            const auto& current_base = current_map.cbegin()->second;
+            if (current_base.ts == base_ts && current_base.streams == base_stream_set) {
                 const auto& latest_entry = current_map.crbegin()->second;
                 from_streams = std::cref(latest_entry);
                 from_ts = latest_entry.ts;
@@ -682,6 +686,33 @@ future<> generation_service::generate_tablet_resize_update(service::group0_updat
     auto diff = co_await _cdc_metadata.generate_stream_diff(current_streams.streams, new_streams);
     auto mut = co_await get_switch_streams_mutation(table, new_ts, std::move(diff), ts);
     co_await muts.add(std::move(mut));
+}
+
+future<> generation_service::generate_vnodes_to_tablets_switch(utils::chunked_vector<canonical_mutation>& muts, table_id table, const locator::tablet_map& tablet_map, api::timestamp_type ts) {
+    if (!_cdc_metadata.has_only_vnode_streams_set(table)) {
+        on_internal_error(cdc_log, format("generate_vnodes_to_tablets_switch: CDC log table {} doesn't have the vnode streams set", table));
+    }
+    const auto table_streams_ptr = _cdc_metadata.get_all_tablet_streams().at(table); // keep alive
+    const auto& vnode_streams = table_streams_ptr->begin()->second;
+
+    utils::chunked_vector<cdc::stream_id> new_streams;
+    co_await utils::reserve_gently(new_streams, tablet_map.tablet_count());
+    for (auto tid : tablet_map.tablet_ids()) {
+        new_streams.emplace_back(tablet_map.get_last_token(tid), 0);
+        co_await coroutine::maybe_yield();
+    }
+
+    auto new_ts = new_generation_timestamp(true, _cfg.ring_delay);
+    cdc_log.info("Switching the CDC log table {} from the vnode-based CDC generations to {} tablet streams at {}", table, new_streams.size(), new_ts);
+    // The streams of the vnode streams set were never written to: the switch
+    // closes all of them and opens all tablet streams, even any stream they
+    // have in common.
+    cdc_stream_diff diff {
+        .closed_streams = vnode_streams.streams,
+        .opened_streams = std::move(new_streams),
+    };
+    auto mut = co_await get_switch_streams_mutation(table, new_ts, std::move(diff), ts);
+    muts.emplace_back(co_await make_canonical_mutation_gently(mut));
 }
 
 future<utils::chunked_vector<mutation>> get_cdc_stream_gc_mutations(table_id table, db_clock::time_point base_ts, const utils::chunked_vector<cdc::stream_id>& base_stream_set, api::timestamp_type ts) {
