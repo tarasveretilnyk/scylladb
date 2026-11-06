@@ -482,6 +482,13 @@ streams change:
 CDC consumers must read the streams of the vnode-based CDC generations up to
 the switch, then the tablet streams from the switch on.
 
+The CDC client libraries, and the connectors built on them, don't do that by
+themselves: a consumer chooses between the streams of the vnode-based CDC
+generations and the tablet streams when it starts, and keeps reading the
+streams it chose. A consumer started before the finalization doesn't get the
+changes after the switch. Restart it once it has read the changes up to the
+switch, and have it read the tablet streams from the switch on.
+
 Once the switch has happened, writes with client-side timestamps more than 5
 seconds older than the current time are rejected if their timestamps are
 before the switch, as writes to a previous CDC generation are.
